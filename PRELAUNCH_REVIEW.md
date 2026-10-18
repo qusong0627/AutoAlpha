@@ -26,6 +26,7 @@
 - 本轮凭证输出修复：`GET /llm-config` 的 chat/embedding endpoint 状态仅返回 scheme+host+port，丢弃 userinfo、路径、query、fragment；MinerU cloud/local base URL 均拒绝内嵌凭证/query/fragment，且无效配置日志不再打印原始 URL。
 - 本轮文档修正：清理方向拆解、文档整理、因子代码生成和 LLM 客户端中“用户 Profile Key 优先”的过时说明，明确当前挖掘部署仅使用服务端环境变量。重建镜像清单后，共同文件差异更新为 74 个（23 个仅换行、51 个内容差异），镜像独有文件 72 个；上游工作树状态为空。
 - 本轮数据库迁移核验：尝试以 `quantmind` 做只读 schema 查询，因本机 PostgreSQL peer 认证拒绝而未能查看列/索引；非交互 `sudo -u postgres` 也因需交互认证失败。未对数据库做任何修改，backend systemd unit 当前 inactive，因此租约迁移与运行态行为仍待有权限的数据库会话验证。
+- 本轮环境与版本控制核验：本地 `web/.env.development.local` 只有 `VITE_*` 地址/模式/免登录开关等变量名，没有 API 凭证变量，且已由 `.gitignore` 排除；环境示例仍可跟踪。原本已初始化但 0 文件、无 HEAD 的本地仓库现建立基线提交 `9c0bd3b`（1,316 文件）；没有 Git remote。已对提交内容做常见密钥格式扫描，未命中。PostgreSQL TCP 密码认证也因未配置可用密码而拒绝，迁移未执行。
 - 本轮启动路径修复：`start-dev.sh` 与 `load-runtime-env.sh` 使用了 Bash 不支持的 `${!name:-}` 间接参数默认展开，会在读取变量时触发 `invalid indirect expansion`。已改为按变量名调用 `printenv`；环境加载器与补全脚本还会拒绝 CR 行尾，避免 Windows CRLF 混入凭证。用当前受保护的 runtime.env 实际加载后仅确认内部/JWT 两个变量，不输出值。
 - 本轮补充：新增 PostgreSQL custom-format 备份、SHA256 校验、保留期清理、夜间 systemd timer 模板和 scratch DB 恢复演练脚本。只读检查发现 PGDATA 在 `/dev/sdd` ext4；E: 虽为另一挂载且有约 281 GB 可用，但 WSL 挂载类型为 9p/DrvFS，当前模式显示 `0777`，不满足私有备份目录要求。timer 未启用或实跑；QuantDB 副本仍未实现。
 - 本轮补充：挖掘任务表增加进程 owner 与租约截止时间；进度只续当前进程持有的活动任务，终态写入受 owner/活动状态约束，启动及每 30 秒回收过期租约。
