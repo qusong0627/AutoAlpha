@@ -163,18 +163,18 @@ proxyReq.setHeader('X-User-Id', process.env.DEV_USER_ID || '10000001');
 
 ---
 
-### P0-3 硬编码的真实 DeepSeek API Key
+### P0-3 审查时发现的硬编码 DeepSeek API Key（历史基线）
 
 **位置**：`scripts/wsl/start-dev.sh:31`
 
 ```bash
-export DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-sk-1ae7************************c1a}
+export DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-<redacted>}
 ```
 
 - 该值是**默认回退**，环境变量未设置时即生效；不是占位符格式。
 - 它是挖掘链路的 LLM 入口，被实际读取：`backend/services/engine/alpha_agent/llm_client.py:148`、`backend/services/engine/rd_agent/llm_env.py:45`。
 - 全仓库 `sk-[A-Za-z0-9]{20,}` 扫描**仅此一处**命中。
-- **本目录不是 git 仓库**（无 `.git`），无法靠改历史清理 → 只能吊销。
+- 审查时目录尚无 Git 基线；后续已建立本地 Git 初始提交。此报告仅保留脱敏示意，不保存 Key 片段。
 
 **修复**：立即到 DeepSeek 控制台**吊销该 Key** 并换新；启动脚本已删除回退并改为只从服务端环境取 LLM 凭证。当前允许 `DEEPSEEK_API_KEY`、`AI_IDE_LLM_API_KEY`、`AI_IDE_API_KEY`、`OPENAI_API_KEY` 中任一项，且拒绝空值/占位符。**在吊销前不要把这个仓库交给任何外部人员。**
 
@@ -212,7 +212,7 @@ export DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-sk-1ae7************************c1a}
 | P1-11 | **依赖完全未锁定，Python 版本约束无人强制** | `requirements-factor-mining.txt` 除 `pyqlib==0.9.7` 外全是 `>=`，无 lock、无 hash；实测已漂到 `pandas 3.0.6 / numpy 2.5.4 / starlette 1.8.0 / SQLAlchemy 2.1.4`；`pyproject.toml:10` 写 `>=3.10`，而 requirements 头注释写"Python 3.14"、正文又要求 3.12 | 无法复现构建；一次 `pip install` 可能拉进破坏性大版本。需 `uv`/`pip-tools` 锁版本 + hash，并在启动脚本里硬校验 3.12。 |
 | P1-12 | **前端生产构建 bake 了空 env，认证开关失效且无登录路由** | `npm run build` 走 production 模式，**不读** `.env.development.local`；实测产物 `import.meta.env` 为空对象、`VITE_DISABLE_AUTH` 从未成为字面量 | 生产构建下 `disableAuth=false`、`getAccessToken()` 返回 null → 请求**不带任何 Authorization**，而应用没有 `/login`。结论：**当前前端只能配 `AUTH_DISABLED=1` 运行**。必须显式决定形态并落地（要么提交 `.env.production` 并接受"故意无认证"，要么补登录路由 + 挂 `authSlice`）。 |
 | P1-13 | **缺生产部署形态**：`/backend-health` 只在 vite dev proxy 里有规则；`run-wsl.sh` 不服务 `web/dist` | `src/workspace/api.ts:46`；`vite.config.ts:29-33`；仓库无 nginx 配置 | 生产下顶部连接状态芯片会永久显示"服务连接异常"（即使后端健康）；且没有"前端产物 + 反代"的部署路径。 |
-| P1-14 | **镜像与上游 `next` 的偏离远超文档** | 审查基线曾记录 **20+ 文件 differ**。2026-10-18 初次按本地文件 Git blob 与 `next` 树比对时为 72 个共同差异；后续修复后重建清单，当前为 **74 个共同文件字节不同，其中 23 个仅换行不同、51 个内容不同；另有 72 个镜像独有文件**；比较范围内 1,797 个上游文件未纳入此精简切片。还发现并修正了 85 个 `docs/` 文件名的 Windows 解包编码损坏（内容与上游 blob 完全一致）。 | 当前清单见 `MIRROR_DIFFS.md`。仍需逐项判断 51 个内容差异和 72 个镜像独有文件是否为有意本地修改；不得盲目从 `next` 覆盖。 |
+| P1-14 | **镜像与上游 `next` 的偏离远超文档** | 审查基线曾记录 **20+ 文件 differ**。2026-10-18 初次按本地文件 Git blob 与 `next` 树比对时为 72 个共同差异；后续修复后重建清单，当前为 **74 个共同文件字节不同，其中 23 个仅换行不同、51 个内容不同；另有 72 个镜像独有文件**；比较范围内 1,797 个上游文件未纳入此精简切片。还发现并修正了 85 个 `docs/` 文件名的 Windows 解包编码损坏（内容与上游 blob 完全一致）。 | 当前清单见 `MIRROR_DIFFS.md`。已核实 16 个内容差异的本地意图；仍有 35 个内容差异及 72 个镜像独有文件待分类；不得盲目从 `next` 覆盖。 |
 
 ---
 
@@ -329,7 +329,7 @@ export DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-sk-1ae7************************c1a}
 - [x] `requirements-factor-mining.lock` 已生成（Linux x86_64 / Python 3.12，SHA256 hashes）；安装入口使用 `--require-hashes`，启动脚本硬校验 Python 3.12。
 - [ ] 补生产部署形态（反代配置 + 服务 `web/dist` + `/backend-health` 规则）
 - [x] 重建"本镜像 vs 上游 `next`"的 blob 差异清单，修复 85 个文档文件名编码错乱，并更新 AGENTS.md（P1-14；可用 `scripts/mirror-diff-inventory.py` 重建清单）
-- [ ] 逐项标注 51 个内容差异和 72 个镜像独有文件的来源/意图，再决定是否需要从 `next` 重新同步（禁止盲目覆盖）
+- [ ] 逐项标注剩余 35 个内容差异和 72 个镜像独有文件的来源/意图，再决定是否需要从 `next` 重新同步（禁止盲目覆盖）
 
 **上线后尽快（P2/P3）**
 

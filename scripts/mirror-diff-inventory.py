@@ -102,6 +102,17 @@ def visible_path(path: str) -> str:
 
 
 def build_report(repo: Path, upstream: Path) -> str:
+    reviewed_section = ""
+    existing_report = repo / "MIRROR_DIFFS.md"
+    if existing_report.is_file():
+        previous = existing_report.read_text(encoding="utf-8")
+        reviewed_marker = "## Reviewed intentional content divergences"
+        newline_marker = "## Newline-only differences"
+        if reviewed_marker in previous and newline_marker in previous:
+            reviewed_section = previous.split(reviewed_marker, 1)[1].split(
+                newline_marker, 1
+            )[0].strip()
+
     remote = upstream_blobs(upstream)
     local = local_blobs(repo)
     common = set(remote) & set(local)
@@ -144,6 +155,15 @@ def build_report(repo: Path, upstream: Path) -> str:
     lines.extend(
         f"- `{visible_path(path)}`" for path in content_different or ["None"]
     )
+    if reviewed_section:
+        lines.extend(
+            [
+                "",
+                "## Reviewed intentional content divergences",
+                "",
+                *reviewed_section.splitlines(),
+            ]
+        )
     lines.extend(["", "## Newline-only differences", ""])
     lines.extend(
         f"- `{visible_path(path)}`" for path in newline_only or ["None"]

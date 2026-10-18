@@ -60,6 +60,20 @@ Within this scope: **74 common files differ at the byte level**; after CRLF/LF n
 - `scripts/alpha_agent/run_rd_agent.py`
 - `scripts/alpha_agent/run_statistical_mining.py`
 
+## Reviewed intentional content divergences
+
+These entries were checked against the local deployment decisions and the actual changed lines. The remaining content differences are still unclassified; this section is not approval to synchronize or overwrite them.
+
+| Path(s) | Intent |
+|---|---|
+| `backend/scripts/export_factor_report.py`; `backend/scripts/factor_dedup_report.py`; `backend/scripts/factor_deep_dive.py`; `backend/scripts/factor_regime_analysis.py`; `backend/scripts/md_to_pdf_report.py` | Replace report branding from `QuantMind` to `AutoAlpha`; no calculation logic changed in the reviewed hunks. |
+| `config/monitoring_config.json`; `config/unified/environments/development.yaml`; `config/unified/environments/production.yaml`; `config/unified/services/ai-strategy.yaml`; `config/unified/shared/security.yaml` | Remove baked-in mail, database, and JWT credential defaults; require environment-provided values or leave them empty. |
+| `AGENTS.md` | Local deployment and mirror-safety instructions; intentionally maintained only in this mirror. |
+| `backend/services/api/routers/admin/__init__.py`; `backend/services/api/routers/admin/alpha_factor_pipeline.py`; `backend/services/engine/qlib_app/services/__init__.py`; `backend/shared/auth.py` | Standalone deployment deltas recorded in `AGENTS.md`: omit unshipped admin routers, bound promote compute, lazy-load the backtest stack, and retire the public development internal secret. |
+| `scripts/README.md` | Replace upstream script guidance with the actual WSL/Windows setup and verification workflow for this mirror. |
+
+Reviewed: **16 of 51** content-different common files. Unclassified: **35 content-different common files** and **72 mirror-only files**.
+
 ## Newline-only differences
 
 - `.npmrc`
