@@ -1,0 +1,125 @@
+/* 4 页面共享样式：浅色 + 圆角 12/10/8/6 */
+:root {
+  --qm-bg: #f5f7fb;
+  --qm-card: #ffffff;
+  --qm-border: #e8ecf3;
+  --qm-text-1: #1f2733;
+  --qm-text-2: #5b6675;
+  --qm-text-3: #98a2b3;
+  --qm-primary: #2f6bff;
+  --qm-up: #e2483f;
+  --qm-down: #17a673;
+}
+
+.qm-page {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 20px 24px 40px;
+}
+
+.qm-page-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin: 4px 0 16px;
+}
+
+.qm-page-head h2 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--qm-text-1);
+}
+
+.qm-page-head span {
+  font-size: 13px;
+  color: var(--qm-text-3);
+}
+
+.qm-card {
+  background: var(--qm-card);
+  border: 1px solid var(--qm-border);
+  border-radius: 12px;
+  padding: 16px 20px;
+  margin-bottom: 16px;
+}
+
+.qm-kpis {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.qm-kpi {
+  background: var(--qm-card);
+  border: 1px solid var(--qm-border);
+  border-radius: 12px;
+  padding: 14px 0;
+  text-align: center;
+}
+
+.qm-kpi .v {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--qm-text-1);
+  font-variant-numeric: tabular-nums;
+}
+
+.qm-kpi .l {
+  font-size: 12px;
+  color: var(--qm-text-3);
+  margin-top: 2px;
+}
+
+.qm-log-view {
+  background: #f6f8fb;
+  border: 1px solid var(--qm-border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  height: 260px;
+  overflow-y: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--qm-text-2);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.qm-factor-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--qm-text-1);
+}
+
+.qm-factor-id {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--qm-text-3);
+}
+
+.qm-factor-expr {
+  font-size: 12px;
+  color: var(--qm-text-2);
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.qm-num {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.qm-filter-row {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.qm-filter-row .grow {
+  flex: 1 1 200px;
+}

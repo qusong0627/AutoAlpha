@@ -1,0 +1,21 @@
+{
+  "A": {
+    "akshare": true,
+    "hsgt_north": true,
+    "hsgt_south": true,
+    "yahoo": false,
+    "quantdb": true
+  },
+  "HK": {
+    "akshare": true,
+    "ccass": true,
+    "hsgt_south": true,
+    "hsgt_north": true,
+    "yahoo": true,
+    "paid": true
+  },
+  "US": {
+    "akshare": true,
+    "yahoo": true
+  }
+}

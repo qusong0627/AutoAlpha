@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly AutoAlpha PostgreSQL backup
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+RandomizedDelaySec=15m
+Unit=autoalpha-pg-backup.service
+
+[Install]
+WantedBy=timers.target

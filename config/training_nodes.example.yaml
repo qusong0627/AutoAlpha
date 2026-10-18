@@ -1,0 +1,48 @@
+# QuantMind AutoDL 远程 GPU 训练节点配置
+#
+# 在此声明一台或多台 AutoDL 训练节点。后端启动后：
+#   - 前端「模型训练」的节点选择器按此列表显示
+#   - 后台「AutoDL 节点」状态面板按此列表展示每台机器实时状态
+#
+# 每台节点一个 `-` 条目。配置项说明：
+#   id           节点唯一标识（训练时通过 node_id 路由）
+#   name         节点显示名（前端展示）
+#   host         节点 IP/域名
+#   port         SSH 端口（默认 22）
+#   user         SSH 用户
+#   ssh_password SSH 密码（与 ssh_key 二选一）
+#   ssh_key      SSH 私钥路径（与 ssh_password 二选一）
+#   work_dir     远端工作目录（特征快照/config/训练产物落盘处）
+#   docker_image 远端训练镜像（quantmind-train:latest）
+#   gpus         远端容器挂载 GPU（all=全部，0/空=CPU，1/2=指定数量）
+#
+# 注意：多台节点共享同一份代码/镜像，各自独立训练、独立回传模型。
+
+nodes: []
+
+  # 示例：按需增删节点
+  # - id: autodl-1
+  #   name: "AutoDL GPU"
+  #   host: "192.0.2.66"
+  #   port: 22
+  #   user: "root"
+  #   ssh_password: ""
+  #   ssh_key: "~/.ssh/autodl1"
+  #   work_dir: "/workspace"
+  #   docker_image: "quantmind-train:latest"
+  #   gpus: "all"
+  # ── 免 Docker 服务器节点包示例(executor=process) ─────────────
+  # 服务器上跑「训练节点一键包」(内嵌 runtime + backend + sync_factors.sh),
+  # 主节点以 SSH + runtime python 直跑训练,不依赖远端 docker。
+  # - id: node-cn-1
+  #   name: "节点包(CN)"
+  #   host: "1.2.3.4"
+  #   port: 22
+  #   user: "root"
+  #   ssh_password: ""
+  #   executor: "process"        # docker=镜像容器编排(默认) / process=免Docker直跑
+  #   pack_root: "/opt/qm-train-node"   # 服务器节点包根(runtime/bin/python3 + backend/ + sync_factors.sh)
+  #   runtime_python: ""          # 缺省取 {pack_root}/runtime/bin/python3
+  #   env_file: "train_env.sh"    # 包内环境(QUANTDB_API_KEY / QM_*_DATA_DIR),留服务器侧
+  #   work_dir: "/opt/qm-train-node/workspace"   # 训练产物/日志目录
+  #   quantdb_dir: "/opt/qm-train-node/data/quantdb"   # CN 数据根(含 6_ml_datasets)

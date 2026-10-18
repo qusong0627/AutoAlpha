@@ -1,0 +1,11 @@
+[Unit]
+Description=Check AutoAlpha backend health every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=15s
+Unit=autoalpha-healthcheck.service
+
+[Install]
+WantedBy=timers.target

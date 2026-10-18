@@ -1,0 +1,888 @@
+"""T-FB-07/08 ``/api/v1/factor-backtest`` 端点组。
+
+职责：把「因子挖掘 → 回测中心」的用例翻成对 engine/store 的编排：
+- ``GET  /markets``            市场档案 + 数据面实况（矩阵列头）
+- ``POST /single``             单因子单市场发起（后台任务，台账 instantly 见）
+- ``POST /single/{id}/cancel`` 取消（kill 子进程；**不动因子行**）
+- ``POST /batch``              批量派发（factors × markets，去重/背压，见 batch.py）
+- ``GET  /batch/status``       批次进度（行终态回读 + 熔断/失败清单）
+- ``GET  /batches``            批次列表（UI 重开页面后找回在跑的批次）
+- ``POST /batch/cancel``       取消批次（杀当前单元；未启动单元不落行）
+- ``POST /matrix``             因子 × 市场适配矩阵（每格=最近一次运行 + 静态兼容
+                               + NW t / p / BY q 显著性列，族校正与 /report 单源）
+- ``GET  /runs``               台账列表（可筛可排的数据面）
+- ``GET  /runs/{id}/series``   曲线下钻（IC/净值/分位/换手）
+- ``GET  /report/{id}``        机构报告标量块（headline/显著性/成本网格/超额标注）
+- ``GET  /report/{id}/pdf``    单报告 PDF 导出（同源同数；落「因子研究」档案目录）
+
+纪律（与旧回测链共存的边界）：
+- 去重与取消**共享** ``alpha_agent`` 的 ``_running_backtests``/
+  ``_backtest_processes``/``_backtest_cancelled``——子进程登记按 factor_id 键，
+  新旧两条链必须全局串行；旧 UI 的取消也能 kill 新链的子进程（反向亦然）。
+- 新链**绝不更新 rd_agent_factors 行**：因子库指标是 CN 语义，跨市场结果只进
+  台账 + 序列表。
+- 后台任务用 ``asyncio.create_task``（engine 常驻进程内）＋测试挂桩点
+  ``_spawn_backtest_run``（TestClient 的请求级 loop 会取消后台任务，路由级
+  测试 monkeypatch 本函数）。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
+
+from backend.services.engine.auth_context import get_authenticated_identity
+from backend.services.engine.factor_backtest import batch, store
+from backend.services.engine.factor_backtest.compat import classify_factor
+from backend.services.engine.factor_backtest.engine import evaluate_factor_market
+from backend.services.engine.factor_backtest.report import (
+    build_report_block,
+    significance_summary,
+)
+from backend.services.engine.factor_backtest.report_pdf import export_report_pdf
+from backend.services.engine.factor_backtest.profiles import (
+    columns_for_market,
+    get_market_profile,
+    list_market_profiles,
+    profile_status,
+)
+from backend.services.engine.routers.alpha_agent import (
+    FactorBacktestCancelled,
+    _backtest_cancelled,
+    _backtest_processes,
+    _detect_factor_kind,
+    _format_backtest_error,
+    _require_owned_factor,
+    _running_backtest_runs,
+    _running_backtests,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/v1/factor-backtest", tags=["factor-backtest"])
+
+#: 矩阵单元格展示的指标键（metrics_json 里拣出来的排序维度）。
+_CELL_METRIC_KEYS = (
+    "ic",
+    "rank_ic",
+    "icir",
+    "rank_icir",
+    "ic_nw_t",
+    "ic_positive_rate",
+    "sharpe",
+    "sharpe_net",
+    "ann_return",
+    "ann_return_net",
+    "ann_vol",
+    "max_drawdown",
+    "ann_turnover",
+    "ls_sharpe",
+    "ls_ann_return",
+    "n_days",
+)
+
+
+class SingleBacktestPayload(BaseModel):
+    factor_id: str = Field(..., min_length=1, max_length=128)
+    market: str = Field(..., min_length=1, max_length=32)
+    universe: str | None = Field(None, max_length=64)
+    start: str | None = Field(None, max_length=16)
+    end: str | None = Field(None, max_length=16)
+    cost_bps: int | None = Field(None, ge=0, le=1000)
+
+
+class MatrixPayload(BaseModel):
+    factor_ids: list[str] = Field(..., min_length=1, max_length=500)
+    markets: list[str] | None = Field(None, max_length=10)
+
+
+class BatchPayload(BaseModel):
+    factor_ids: list[str] = Field(..., min_length=1, max_length=200)
+    markets: list[str] | None = Field(None, max_length=10)  # None = 全部市场
+    start: str | None = Field(None, max_length=16)
+    end: str | None = Field(None, max_length=16)
+    cost_bps: int | None = Field(None, ge=0, le=1000)
+
+
+class BatchCancelPayload(BaseModel):
+    batch_id: str = Field(..., min_length=1, max_length=64)
+
+
+def _spawn_backtest_run(coro) -> None:
+    """后台启动（测试挂桩点，其语义见模块 docstring）。"""
+    asyncio.create_task(coro)
+
+
+def _kill_backtest_process(factor_id: str) -> None:
+    """kill 该因子在跑的子进程（terminate → 等 2s → kill）。"""
+    proc = _backtest_processes.get(factor_id)
+    if not proc or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        for _ in range(10):
+            if proc.poll() is not None:
+                break
+            import time
+
+            time.sleep(0.2)  # noqa: ASYNC251 — 由取消端点在线程侧短等，最长 2s
+        if proc.poll() is None:
+            proc.kill()
+            logger.warning(
+                "[factor-backtest] force-killed subprocess for %s", factor_id
+            )
+    except ProcessLookupError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[factor-backtest] cancel kill %s failed: %s", factor_id, e)
+
+
+# ── 市场档案 ─────────────────────────────────────────────────────────
+
+
+@router.get("/markets")
+async def list_markets():
+    """五市场档案 + 数据面实况（CN 列 = 样本内基准，其余样本外）。"""
+    rows = []
+    for profile in list_market_profiles():
+        status = profile_status(profile)
+        status.pop("provider", None)  # 路径是内部实现细节，不出接口
+        rows.append(status)
+    return {"code": 200, "data": {"markets": rows, "total": len(rows)}}
+
+
+# ── 单因子发起 / 取消 ────────────────────────────────────────────────
+
+
+@router.post("/single")
+async def start_single_backtest(request: Request, payload: SingleBacktestPayload):
+    """发起单因子单市场回测（异步；台账行秒级可见，前端轮询 /runs）。"""
+    factor = await _require_owned_factor(payload.factor_id, request)
+    if not factor.get("factor_code"):
+        raise HTTPException(status_code=400, detail="因子代码为空，无法回测")
+    try:
+        profile = get_market_profile(payload.market)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    factor_id = payload.factor_id
+    if factor_id in _running_backtests:
+        return {
+            "code": 200,
+            "data": {
+                "factor_id": factor_id,
+                "status": "running",
+                "message": "回测已在进行中",
+            },
+        }
+
+    # 静态预检只为台账行先记上 kind；终态裁决在 engine（data_unsupported 等
+    # 也要落一行——矩阵需要看到「为什么没有数字」）。
+    try:
+        kind = _detect_factor_kind(factor.get("factor_code") or "")
+    except RuntimeError:
+        kind = "unknown"
+
+    # 占位：check→add 之间无 await，双击不会并发双跑（照旧链同纪律）。
+    _running_backtests.add(factor_id)
+    try:
+        from backend.services.engine.rd_agent.factor_sources import source_snapshot
+
+        _src_snap = source_snapshot(factor.get("factor_code") or "")
+    except Exception:  # noqa: BLE001 - 溯源失败不拦回测
+        _src_snap = {}
+    try:
+        run_id = await store.start_run(
+            factor_id,
+            kind=kind,
+            market=payload.market,
+            universe=payload.universe or profile.default_universe,
+            params={
+                "universe": payload.universe,
+                "start": payload.start,
+                "end": payload.end,
+                "cost_bps": payload.cost_bps,
+                **_src_snap,
+            },
+            factor_name=factor.get("factor_name"),
+            user_id=factor.get("user_id"),
+        )
+    except Exception as exc:
+        _running_backtests.discard(factor_id)
+        logger.error("[factor-backtest] 台账登记失败 %s: %s", factor_id, exc)
+        raise HTTPException(status_code=500, detail="台账登记失败") from exc
+    _running_backtest_runs[factor_id] = run_id
+
+    _spawn_backtest_run(
+        _run_single(
+            factor_id,
+            factor,
+            run_id,
+            market=payload.market,
+            universe=payload.universe,
+            start=payload.start,
+            end=payload.end,
+            cost_bps=payload.cost_bps,
+        )
+    )
+    return {
+        "code": 200,
+        "data": {
+            "factor_id": factor_id,
+            "run_id": run_id,
+            "market": payload.market,
+            "status": "running",
+            "message": f"跨市场回测已触发: {factor.get('factor_name')} @ {profile.label}",
+        },
+    }
+
+
+@router.post("/single/{factor_id}/cancel")
+async def cancel_single_backtest(factor_id: str, request: Request):
+    """取消进行中的跨市场回测（kill 子进程 + 台账收口 cancelled）。
+
+    与旧取消端点的差异：**不写 rd_agent_factors 行**（跨市场 run 的纪律）。
+    去重标记不在本端点拆——归后台任务 finally 以身份守卫清理（旧实现同注释：
+    提前拆会让旧任务的延迟收尾误拆新任务的标记）。
+    """
+    await _require_owned_factor(factor_id, request)
+    if factor_id not in _running_backtests:
+        return {
+            "code": 200,
+            "data": {
+                "factor_id": factor_id,
+                "status": None,
+                "message": "回测未在运行",
+            },
+        }
+    _backtest_cancelled.add(factor_id)
+    _kill_backtest_process(factor_id)
+    run_id = _running_backtest_runs.get(factor_id)
+    if run_id:
+        try:
+            await store.finish_run(run_id, "cancelled", error="cancelled_by_user")
+        except Exception as exc:  # noqa: BLE001 — 收口失败由任务侧兜底
+            logger.warning("[factor-backtest] cancel 收口失败 %s: %s", run_id, exc)
+    return {"code": 200, "data": {"factor_id": factor_id, "status": "cancelled"}}
+
+
+async def evaluate_and_record(
+    factor_id: str,
+    factor: dict,
+    run_id: str,
+    *,
+    market: str,
+    universe: str | None,
+    start: str | None,
+    end: str | None,
+    cost_bps: int | None,
+) -> dict:
+    """engine 求值 → 台账收口（+ 序列落盘）；返回求值结果。
+
+    收口映射是**唯一实现**：路由后台任务（:func:`_run_single`）与 T-MV-09
+    验证脚本（``backend/scripts/mining_factor_validate.py``）都经本函数写
+    ``rd_agent_factor_backtests`` 台账——两份调用方拿到的终态语义逐字一致。
+
+    异常路径：先记终态（cancelled/failed）再**原样抛出**；调用方决定吞或续
+    （路由后台任务吞掉，验证脚本据此降级报告）。
+    """
+    try:
+        res = await evaluate_factor_market(
+            factor,
+            market=market,
+            universe=universe,
+            start=start,
+            end=end,
+            cost_bps=cost_bps,
+        )
+        win = res.get("window") or {}
+        date_range = (
+            f"{win.get('start')}~{win.get('end')}" if win.get("start") else None
+        )
+        if res["status"] == "ok":
+            m = res["metrics"] or {}
+            await store.finish_run(
+                run_id,
+                "completed",
+                ic_value=m.get("ic"),
+                rank_ic=m.get("rank_ic"),
+                icir=m.get("icir"),
+                rank_icir=m.get("rank_icir"),
+                sharpe_ratio=m.get("sharpe"),
+                annual_return=m.get("ann_return"),
+                max_drawdown=m.get("max_drawdown"),
+                universe=res.get("universe"),
+                data_source="qlib_bin",
+                date_range=date_range,
+                metrics=m,
+            )
+            if res.get("series") is not None:
+                try:
+                    await store.save_series(
+                        run_id,
+                        factor_id=factor_id,
+                        market=market,
+                        payload=res["series"],
+                    )
+                except Exception as exc:  # noqa: BLE001 — 序列是下钻层：缺失可复检
+                    logger.warning(
+                        "[factor-backtest] 序列落盘失败（不拦收口）%s: %s", run_id, exc
+                    )
+        else:
+            await store.finish_run(
+                run_id,
+                res["status"],
+                error=(res.get("message") or res.get("reason")),
+                universe=res.get("universe"),
+                data_source="qlib_bin",
+                date_range=date_range,
+            )
+        return res
+    except FactorBacktestCancelled:
+        try:
+            await store.finish_run(run_id, "cancelled", error="cancelled_by_user")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[factor-backtest] cancelled 收口失败 %s: %s", run_id, exc)
+        raise
+    except Exception as exc:  # noqa: BLE001 — 兜底：任何异常都得有终态
+        logger.exception("[factor-backtest] %s 后台任务异常", factor_id)
+        try:
+            await store.finish_run(
+                run_id, "failed", error=_format_backtest_error(exc)[-1500:]
+            )
+        except Exception as exc2:  # noqa: BLE001
+            logger.error("[factor-backtest] failed 收口失败 %s: %s", run_id, exc2)
+        raise
+
+
+async def _run_single(
+    factor_id: str,
+    factor: dict,
+    run_id: str,
+    *,
+    market: str,
+    universe: str | None,
+    start: str | None,
+    end: str | None,
+    cost_bps: int | None,
+) -> None:
+    """单因子回测后台任务：engine 求值 → 台账收口（+ 序列落盘）→ 去重清理。
+
+    求值与台账收口的唯一实现在 :func:`evaluate_and_record`；本函数只承担
+    后台任务语义：异常已由收口侧记终态，这里吞掉不再外抛（后台任务无处可
+    抛），finally 做身份守卫清理。
+    """
+    try:
+        await evaluate_and_record(
+            factor_id,
+            factor,
+            run_id,
+            market=market,
+            universe=universe,
+            start=start,
+            end=end,
+            cost_bps=cost_bps,
+        )
+    except Exception:  # noqa: BLE001 — 终态已收口（含 cancelled），后台任务无处可抛
+        pass
+    finally:
+        # 身份守卫清理（照旧链 finally 注释）：取消→立即重跑后，旧任务延迟收尾
+        # 不得拆新任务的去重键/取消标记。
+        if (
+            factor_id not in _running_backtest_runs
+            or _running_backtest_runs[factor_id] == run_id
+        ):
+            _running_backtest_runs.pop(factor_id, None)
+            _running_backtests.discard(factor_id)
+            _backtest_cancelled.discard(factor_id)
+
+
+# ── 批量派发 / 进度 / 取消 ───────────────────────────────────────────
+
+
+def _require_owned_batch(row: dict, request: Request) -> None:
+    """批次归属：他人批次一律 404（不泄露存在性）；空属主历史行只读可见。"""
+    auth_user_id, _ = get_authenticated_identity(request)
+    owner = row.get("user_id")
+    if owner and owner != auth_user_id:
+        raise HTTPException(
+            status_code=404, detail=f"Batch {row['batch_id']} not found"
+        )
+
+
+@router.post("/batch")
+async def start_batch_backtest(request: Request, payload: BatchPayload):
+    """批量派发：factors × markets 单元集合（服务端串行排水，进度走 /batch/status）。
+
+    派发前把关（都进响应的 skipped 清单，绝不静默丢）：
+    - 因子归属/代码空 → 跳过该因子（归属不符按 404 语义统一成「不可见或不存在」）；
+    - 背压：因子名下已有活跃 running 行（单发或他批）→ 跳过其全部单元。
+    """
+    auth_user_id, _ = get_authenticated_identity(request)
+    factor_ids = list(dict.fromkeys(payload.factor_ids))
+    markets = list(
+        dict.fromkeys(payload.markets or [p.market for p in list_market_profiles()])
+    )
+    for m in markets:
+        try:
+            get_market_profile(m)
+        except KeyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    skipped: list[dict[str, Any]] = []
+    factors: dict[str, dict] = {}
+    for fid in factor_ids:
+        try:
+            factor = await _require_owned_factor(fid, request)
+        except HTTPException:
+            skipped.append(
+                {"factor_id": fid, "market": None, "reason": "因子不可见或不存在"}
+            )
+            continue
+        if not factor.get("factor_code"):
+            skipped.append({"factor_id": fid, "market": None, "reason": "因子代码为空"})
+            continue
+        factors[fid] = factor
+
+    if factors:
+        busy = {r["factor_id"] for r in await store.running_factor_pairs(list(factors))}
+        for fid in [f for f in factors if f in busy]:
+            del factors[fid]
+            skipped.append(
+                {"factor_id": fid, "market": None, "reason": "已有进行中的回测"}
+            )
+
+    if not factors:
+        return {
+            "code": 200,
+            "data": {
+                "batch_id": None,
+                "total": 0,
+                "queued": 0,
+                "skipped": skipped,
+                "status": "empty",
+                "message": "没有可派发的因子（全部跳过）",
+            },
+        }
+
+    kinds: dict[str, str] = {}
+    for fid, factor in factors.items():
+        try:
+            kinds[fid] = _detect_factor_kind(factor.get("factor_code") or "")
+        except RuntimeError:
+            kinds[fid] = "unknown"
+
+    try:
+        result = await batch.launch(
+            factors=factors,
+            kinds=kinds,
+            markets=markets,
+            start=payload.start,
+            end=payload.end,
+            cost_bps=payload.cost_bps,
+            user_id=auth_user_id,
+            skipped=skipped,
+        )
+    except Exception as exc:
+        logger.error("[factor-backtest] 批量派发失败: %s", exc)
+        raise HTTPException(status_code=500, detail="批量派发失败") from exc
+    result["status"] = "running"
+    result["message"] = (
+        f"批量回测已派发: {len(factors)} 因子 × {len(markets)} 市场"
+        f" = {result['total']} 单元"
+    )
+    return {"code": 200, "data": result}
+
+
+@router.get("/batches")
+async def list_backtest_batches(
+    request: Request,
+    limit: int = Query(20, ge=1, le=100),
+):
+    """批次列表（新→旧；UI 重开页面后找回在跑/近期批次）。"""
+    auth_user_id, _ = get_authenticated_identity(request)
+    rows = await store.list_batches(user_id=auth_user_id, limit=limit)
+    return {"code": 200, "data": {"batches": rows, "total": len(rows)}}
+
+
+@router.get("/batch/status")
+async def get_batch_status(batch_id: str, request: Request):
+    """批次进度：单元计数/明细全部来自台账行终态回读；失败单元单列清单。
+
+    重启可重入的**兜底入口**：DB 仍 running 但进程内无状态（重启过/创建方
+    未入队成功）→ 就地重建续跑（engine 启动时的 resume_interrupted 是主入口）。
+    """
+    row = await store.get_batch(batch_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Batch {batch_id} not found")
+    _require_owned_batch(row, request)
+    if batch_id not in batch._STATES and row.get("status") == "running":
+        try:
+            await batch.resume_batch(batch_id)
+        except Exception as exc:  # noqa: BLE001 — 恢复失败不拦查询
+            logger.warning("[factor-backtest] 批次恢复失败 %s: %s", batch_id, exc)
+    data = await batch.get_batch_status(batch_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail=f"Batch {batch_id} not found")
+    return {"code": 200, "data": data}
+
+
+@router.post("/batch/cancel")
+async def cancel_batch_backtest(request: Request, payload: BatchCancelPayload):
+    """取消批次：杀当前单元子进程 + 批次行收口；未启动单元不落行。"""
+    row = await store.get_batch(payload.batch_id)
+    if row is None:
+        raise HTTPException(
+            status_code=404, detail=f"Batch {payload.batch_id} not found"
+        )
+    _require_owned_batch(row, request)
+    if row.get("status") != "running":
+        return {
+            "code": 200,
+            "data": {
+                "batch_id": payload.batch_id,
+                "status": row["status"],
+                "killed": [],
+                "message": "批次已收口，无需取消",
+            },
+        }
+    result = await batch.cancel_batch(payload.batch_id)
+    fresh = await store.get_batch(payload.batch_id)
+    return {
+        "code": 200,
+        "data": {
+            "batch_id": payload.batch_id,
+            "status": (fresh or row).get("status"),
+            "killed": result["killed"],
+            "message": f"已取消：中止 {len(result['killed'])} 个在跑单元",
+        },
+    }
+
+
+# ── 矩阵 ─────────────────────────────────────────────────────────────
+
+
+@router.post("/matrix")
+async def factor_market_matrix(request: Request, payload: MatrixPayload):
+    """因子 × 市场适配矩阵：每格 = 最近一次运行（任意终态）+ 静态兼容档。
+
+    CN 列为样本内基准并排列出；未跑过的格子给出静态兼容判定（portable /
+    data_unsupported / unknown），「能不能跑」与「跑出来怎样」分开呈现。
+    """
+    auth_user_id, _ = get_authenticated_identity(request)
+    for m in payload.markets or []:
+        try:
+            get_market_profile(m)
+        except KeyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    metas = await store.get_factor_meta(payload.factor_ids)
+    by_id = {m["factor_id"]: m for m in metas}
+    # 归属过滤（与 _require_owned_factor 同语义：owner 为空的历史行只读可见）
+    visible = [
+        fid
+        for fid in payload.factor_ids
+        if fid in by_id
+        and (not by_id[fid].get("user_id") or by_id[fid]["user_id"] == auth_user_id)
+    ]
+
+    all_markets = [p.market for p in list_market_profiles()]
+    markets = payload.markets or all_markets
+    cells = await store.latest_cells(visible, markets)
+    cell_map = {(c["factor_id"], c["market"]): c for c in cells}
+    # 显著性（T-FB-18）：NW t / p / BY q——族校正与 /report 单源，每批次只查一次
+    sig_by_run = await _matrix_significance_by_run(cells)
+
+    profiles = {p.market: p for p in list_market_profiles()}
+    factors_out: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+    for fid in payload.factor_ids:
+        meta = by_id.get(fid)
+        code = (meta or {}).get("factor_code") or ""
+        row: dict[str, Any] = {
+            "factor_id": fid,
+            "factor_name": (meta or {}).get("factor_name"),
+            "found": meta is not None,
+            "owned": fid in visible,
+            "cn_ic": (meta or {}).get("ic_value"),
+            "cells": {},
+        }
+        for m in markets:
+            compat = classify_factor(code, columns_for_market(m))
+            run = cell_map.get((fid, m)) if fid in visible else None
+            row["cells"][m] = _matrix_cell(
+                run,
+                compat,
+                profiles[m],
+                sig_by_run.get(run["run_id"]) if run else None,
+            )
+            counts[row["cells"][m]["status"]] = (
+                counts.get(row["cells"][m]["status"], 0) + 1
+            )
+        factors_out.append(row)
+
+    return {
+        "code": 200,
+        "data": {
+            "markets": [
+                {
+                    "market": p.market,
+                    "label": p.label,
+                    "in_sample": p.in_sample,
+                    "experimental": p.experimental,
+                    "benchmark": p.benchmark,
+                    "cost_bps": p.cost_bps,
+                }
+                for p in list_market_profiles()
+                if p.market in markets
+            ],
+            "factors": factors_out,
+            "counts": counts,
+        },
+    }
+
+
+async def _matrix_significance_by_run(
+    runs: list[dict[str, Any]],
+) -> dict[str, dict[str, Any] | None]:
+    """run_id → 显著性摘要（NW t / p / BY q / 族），与 ``/report`` 单源同口径。
+
+    族 = 同批次全部完成单元的 ``metrics.ic_nw_t``（每批次只查一次，整矩阵
+    共用）；自身不在族内 / 无批次 → 由 :func:`significance_summary` 回落
+    ``q = p``（n=1）。非完成终态或无 ``ic_nw_t`` → None（格显「—」，不造数）。
+    """
+    batches: dict[str, str] = {
+        r["run_id"]: r["batch_id"]
+        for r in runs
+        if r.get("status") == "completed" and r.get("batch_id")
+    }
+    families: dict[str, tuple[list[float], dict[str, int]]] = {}
+    for batch_id in dict.fromkeys(batches.values()):
+        siblings = await store.batch_runs(batch_id)
+        nw_ts: list[float] = []
+        index: dict[str, int] = {}
+        for s in siblings:
+            if s.get("status") != "completed":
+                continue
+            t = (s.get("metrics") or {}).get("ic_nw_t")
+            if t is None:
+                continue
+            index[s["run_id"]] = len(nw_ts)
+            nw_ts.append(float(t))
+        families[batch_id] = (nw_ts, index)
+
+    out: dict[str, dict[str, Any] | None] = {}
+    for r in runs:
+        nw_t = (r.get("metrics") or {}).get("ic_nw_t")
+        if r.get("status") != "completed" or nw_t is None:
+            out[r["run_id"]] = None
+            continue
+        family = families.get(batches.get(r["run_id"], ""))
+        if family and r["run_id"] in family[1]:
+            out[r["run_id"]] = significance_summary(
+                nw_t, family[0], family[1][r["run_id"]]
+            )
+        else:
+            out[r["run_id"]] = significance_summary(nw_t)
+    return out
+
+
+def _matrix_cell(
+    run: dict[str, Any] | None,
+    compat: dict,
+    profile,
+    significance: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """单元格：未跑过 → not_run（带静态兼容档）；跑过 → 最近一次运行摘要。"""
+    cell: dict[str, Any] = {
+        "status": "not_run",
+        "run_id": None,
+        "compat": compat["status"],
+        "missing": compat["missing"],
+        "dynamic": compat["dynamic"],
+        "error": None,
+        "universe": None,
+        "date_range": None,
+        "finished_at": None,
+        "in_sample": profile.in_sample,
+        "metrics": {},
+        "significance": None,
+    }
+    if run is None:
+        return cell
+    metrics = run.get("metrics") or {}
+    cell.update(
+        {
+            "status": run["status"],
+            "run_id": run["run_id"],
+            "error": run.get("error"),
+            "universe": run.get("universe"),
+            "date_range": run.get("date_range"),
+            "finished_at": (
+                run["finished_at"].isoformat() if run.get("finished_at") else None
+            ),
+            "metrics": {k: metrics.get(k) for k in _CELL_METRIC_KEYS if k in metrics},
+            "significance": significance,
+        }
+    )
+    # 排序便利键（前端排名视图直接排；缺失一律 None 显示「—」）。metrics_json
+    # 是主源（新引擎全键齐备）；缺键回落台账列（旧 CN 回测只写了 icir 等专列，
+    # metrics 里没有 ic/sharpe——矩阵要把新旧两代 CN 行都装进同一张表）。
+    for key, col in (
+        ("ic", "ic_value"),
+        ("rank_ic", "rank_ic"),
+        ("icir", "icir"),
+        ("sharpe", "sharpe_ratio"),
+        ("ann_return_net", "annual_return"),
+        ("max_drawdown", "max_drawdown"),
+    ):
+        val = cell["metrics"].get(key)
+        cell[key] = val if val is not None else run.get(col)
+    return cell
+
+
+# ── 台账 / 曲线 ──────────────────────────────────────────────────────
+
+
+@router.get("/runs")
+async def list_backtest_runs(
+    factor_id: str,
+    request: Request,
+    market: str | None = Query(None, description="按市场筛选"),
+    status: str | None = Query(None, description="按终态筛选"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """回测台账列表（新→旧，可筛可排的数据面）。"""
+    await _require_owned_factor(factor_id, request)
+    rows = await store.list_runs(
+        factor_id=factor_id,
+        market=market,
+        status=status,
+        limit=limit,
+        offset=offset,
+    )
+    return {"code": 200, "data": {"runs": rows, "total": len(rows)}}
+
+
+@router.get("/runs/{run_id}/series")
+async def get_backtest_series(run_id: str, request: Request):
+    """曲线下钻：IC 序列 / 净值 / 分位桶 / 换手（JSON 安全载荷）。"""
+    run = await store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+    await _require_owned_factor(run["factor_id"], request)
+    series = await store.get_series(run_id)
+    if series is None:
+        raise HTTPException(
+            status_code=404,
+            detail="该运行没有曲线数据（未完成或为降级终态）",
+        )
+    return {"code": 200, "data": {"run": run, "series": series["series"]}}
+
+
+# ── 机构报告（T-FB-16）──────────────────────────────────────────────
+
+
+async def _assemble_report_block(
+    run: dict[str, Any],
+    run_id: str,
+    series: dict[str, Any] | None,
+    *,
+    n_trials: int | None,
+) -> dict[str, Any]:
+    """报告标量块装配（``/report`` 与 ``/report/pdf`` 共用的单源，含批内族校正）。
+
+    族校正（BHY q 与 DSR 试次数默认值）：run 挂在批次上时读**同批次全部完成
+    单元**的 ``metrics.ic_nw_t`` 组族（一次派发即一族假设）；自身不在族内
+    （如 NW t 缺失）或无批次 → 回落 n=1，块内 family_note/dsr_note 明说口径。
+    """
+    family_nw_t: list[float] | None = None
+    self_index = 0
+    if series and run.get("status") == "completed" and run.get("batch_id"):
+        siblings = await store.batch_runs(run["batch_id"])
+        pairs: list[tuple[str, float]] = []
+        for s in siblings:
+            if s.get("status") != "completed":
+                continue
+            t = (s.get("metrics") or {}).get("ic_nw_t")
+            if t is None:
+                continue
+            pairs.append((s["run_id"], float(t)))
+        # 自身必须在族表内才启用校正——找不到（自身 t 缺失）宁可回落 n=1，
+        # 绝不把别的单元的 q 按位错配给本 run。
+        idx = next((i for i, (rid, _) in enumerate(pairs) if rid == run_id), None)
+        if idx is not None:
+            family_nw_t = [t for _, t in pairs]
+            self_index = idx
+
+    return build_report_block(
+        run,
+        series,
+        family_nw_t=family_nw_t,
+        self_index=self_index,
+        n_trials=n_trials,
+        n_trials_source="param" if n_trials is not None else None,
+    )
+
+
+@router.get("/report/{run_id}")
+async def get_backtest_report(
+    run_id: str,
+    request: Request,
+    n_trials: int | None = Query(
+        None, ge=1, le=100000, description="DSR 去膨胀试次数（覆盖批内默认）"
+    ),
+):
+    """机构报告标量块：headline / 显著性（NW t、BY q、DSR、Bootstrap）/ 成本网格。
+
+    - 族校正口径见 :func:`_assemble_report_block`（两端点共用单源）。
+    - 非完成终态 / 序列缺失 → 200 + ``report.available=False`` + reason（诚实
+      降级：前端展示原因而不是数字）；run 不存在 404；他人因子 404。
+    """
+    run = await store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+    await _require_owned_factor(run["factor_id"], request)
+
+    series_row = await store.get_series(run_id)
+    series = (series_row or {}).get("series")
+
+    report = await _assemble_report_block(run, run_id, series, n_trials=n_trials)
+    return {"code": 200, "data": {"run": run, "report": report}}
+
+
+@router.get("/report/{run_id}/pdf")
+async def export_backtest_report_pdf(run_id: str, request: Request):
+    """单报告 PDF 导出（落「因子研究」档案目录；同一 run 幂等覆盖同文件）。
+
+    - 数据面与 ``GET /report/{run_id}`` 同源同数（含批内族校正；试次数用默认
+      口径——导出件没有交互入口传参，与前端展示的数值保持一致）；
+    - 渲染（reportlab）走 ``asyncio.to_thread``，不阻塞引擎事件循环；
+    - 非完成终态 / 序列缺失 / 降级块 → 409 + reason（绝不产出无数字 PDF）；
+      run 不存在 404；他人因子 404。
+    """
+    run = await store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+    await _require_owned_factor(run["factor_id"], request)
+
+    series_row = await store.get_series(run_id)
+    series = (series_row or {}).get("series")
+    report = await _assemble_report_block(run, run_id, series, n_trials=None)
+
+    try:
+        path, filename = await asyncio.to_thread(export_report_pdf, run, series, report)
+    except ValueError as exc:
+        # 降级块：把业务原因原文带给用户（不是服务端错误）
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 — 渲染引擎异常：细节已进日志
+        raise HTTPException(
+            status_code=500, detail="PDF 渲染失败，请查看引擎服务日志"
+        ) from exc
+    return FileResponse(path, media_type="application/pdf", filename=filename)

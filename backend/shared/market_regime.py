@@ -1,0 +1,265 @@
+"""市场状态（regime）口径单源（T-P6-13）：bull / neutral / bear 三级。
+
+**唯一分级实现**：``classify_regime``（纯函数）。日频 ``MarketStateService``（qlib_app，
+回测/策略动态仓位）与日内 regime 服务（实时轨）共用——两侧任何改动必须同时过
+``backend/tests/test_market_regime.py`` 的口径金样。
+
+**日频语义（迁移自 MarketStateService，2026-09-17 逐行对齐）**：
+- 输入逐日滚动：``ret = close/close.shift(window)-1``；``vol = daily_ret.rolling(window).std()``；
+  ``vratio = volume / volume.rolling(window).mean()``；
+- **标注位移**：第 i 行算出的状态标注到第 i+1 行的日期（防未来函数）；
+- 规则：ret≥ret_up 且 vol≤vol_high → bull；ret≤ret_down 且 vol≥vol_high → bear；
+  vratio≥volume_ratio_high 且 ret≥0 → bull；否则 neutral；ret/vol 为 NaN → neutral。
+
+**日内语义**：历史行用收盘价/量，当日行用 live 值构形成输入（``forming_inputs``）——
+15:00 终值收敛后与日频同式同值（验收 T-P6-13）。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+from collections import Counter
+from collections.abc import Mapping
+from typing import Any
+
+DEFAULT_THRESHOLDS: dict[str, float] = {
+    "ret_up": 0.02,
+    "ret_down": -0.02,
+    "vol_high": 0.03,
+    "volume_ratio_high": 1.2,
+}
+DEFAULT_WINDOW = 20
+DEFAULT_REGIME_INDEX = "000300.SH"  # 与 backtest_health.DEFAULT_REGIME_INDEX 同源
+
+#: 各市场 regime 指数映射（设计 §6.1，2026-10-09 实测数据可得性）。
+#: CN=沪深300（QuantDB qdb_index_daily）；HK=恒生指数、US=标普 500
+#: （各自 ``1_kline_data/index_daily``，HK 2013-08 起 / US 2004-01 起）。
+#: **取不到就缺行，禁止拿 000300 冒充**；表外的市场（CRYPTO/FUTURES）没有
+#: 指数口径，persist 侧一律诚实拒绝，不猜。
+REGIME_INDEX_BY_MARKET: dict[str, str] = {
+    "CN": DEFAULT_REGIME_INDEX,
+    "HK": "HSI.HK",
+    "US": "SPX.US",
+}
+STATES = ("bull", "neutral", "bear")
+POSITION_BY_STATE: dict[str, float] = {"bull": 1.0, "neutral": 0.7, "bear": 0.3}
+
+
+def thresholds_fingerprint(
+    window: int = DEFAULT_WINDOW,
+    thresholds: dict[str, float] | None = None,
+) -> str:
+    """计算参数指纹（sha256 十六进制）：window + 阈值全集，排序规范化。
+
+    ``qm_regime_daily.thresholds_hash`` 用——口径改动 = 指纹变化向前生效；
+    存量行的指纹即「写入当时的口径」审计证据（历史行不重算）。
+    """
+    th = thresholds or DEFAULT_THRESHOLDS
+    payload = json.dumps(
+        {"window": int(window), "thresholds": {k: th[k] for k in sorted(th)}},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def classify_regime(
+    ret: float | None,
+    vol: float | None,
+    vratio: float | None,
+    thresholds: dict[str, float] | None = None,
+) -> str:
+    """唯一分级谓词（NaN/缺值 → neutral；与日频原实现逐行一致）。"""
+    th = thresholds or DEFAULT_THRESHOLDS
+    if ret is None or vol is None:
+        return "neutral"
+    if math.isnan(ret) or math.isnan(vol):
+        return "neutral"
+    if ret >= th["ret_up"] and vol <= th["vol_high"]:
+        return "bull"
+    if ret <= th["ret_down"] and vol >= th["vol_high"]:
+        return "bear"
+    if vratio is not None and not math.isnan(vratio):
+        if vratio >= th["volume_ratio_high"] and ret >= 0:
+            return "bull"
+    return "neutral"
+
+
+def build_state_rows(
+    closes: list[float],
+    volumes: list[float] | None,
+    dates: list[str],
+    window: int = DEFAULT_WINDOW,
+    thresholds: dict[str, float] | None = None,
+    *,
+    tail_effective_date: str | None = None,
+) -> list[dict[str, Any]]:
+    """日频序列构造（行版，唯一滚动循环）：dates 与 closes 等长升序；第 i 行状态标注到 dates[i+1]。
+
+    与 MarketStateService.build_market_state_series 的 qlib 取数层解耦——口径在
+    classify_regime，本函数只负责滚动窗口与标注位移。行带三输入统计
+    （ret/vol/vratio），供 ``qm_regime_daily`` 持久化留痕（设计 §6.2）。
+
+    ``tail_effective_date``（可选）：额外把**末根 bar** 标注到该日期——用于
+    「数据末根 bar 的下一交易日」尾行（日历给定；节假日/周末期间数据里没有
+    那根 bar，自然配对写不出这一行，次日盘前推理就拿不到当日生效值，见
+    §6.4 必要条件）。仅当它**严格晚于** ``dates[-1]`` 时生效（防御：不早于
+    末根 bar 的标注会让时间线自相矛盾）；数据补齐后，自然配对
+    (末根 → 真实下一根) 会算出同一状态 → ``insert_frozen_rows`` 冻结冲突，
+    天然幂等。缺省 None = 行为与旧版逐位一致。
+    """
+    n = len(closes)
+    if n != len(dates):
+        raise ValueError("closes 与 dates 长度必须一致")
+    use_vol = volumes if volumes and len(volumes) == n else [1.0] * n
+    rows: list[dict[str, Any]] = []
+    if n <= window + 1:
+        return rows
+
+    def _row_at(i: int, effective: str) -> dict[str, Any]:
+        ret = _roll_ret(closes, i, window)
+        vol = _roll_std(closes, i, window)
+        vratio = _roll_vratio(use_vol, i, window)
+        return {
+            "effective_date": effective,
+            "state": classify_regime(ret, vol, vratio, thresholds),
+            "ret_window": ret,
+            "vol_window": vol,
+            "volume_ratio": vratio,
+        }
+
+    for i in range(window, n - 1):
+        rows.append(_row_at(i, str(dates[i + 1])))
+    if tail_effective_date is not None and str(tail_effective_date) > str(dates[-1]):
+        rows.append(_row_at(n - 1, str(tail_effective_date)))
+    return rows
+
+
+def build_state_series(
+    closes: list[float],
+    volumes: list[float] | None,
+    dates: list[str],
+    window: int = DEFAULT_WINDOW,
+    thresholds: dict[str, float] | None = None,
+) -> dict[str, str]:
+    """日频序列构造（纯 list 版）：dates 与 closes 等长升序；第 i 行状态标注到 dates[i+1]。
+
+    薄封装 ``build_state_rows``（口径与滚动实现在那里，本函数只做投影）。
+    """
+    return {
+        row["effective_date"]: row["state"]
+        for row in build_state_rows(closes, volumes, dates, window, thresholds)
+    }
+
+
+def monthly_states(
+    effective_states: Mapping[str, str], *, tie_break: str = "neutral"
+) -> dict[str, str]:
+    """生效日状态序列 → 月状态（``YYYY-MM`` → 当月生效日多数票；平票取 ``tie_break``）。
+
+    输入即 :func:`build_state_series` 的输出（effective_date → state）；月标签
+    取生效日前 7 位。平票默认 neutral——挑「最中间」的档，不虚报牛/熊。
+    未知状态值立即报错（自家产物，静默丢弃只会把口径错误藏起来）。
+    """
+    if tie_break not in STATES:
+        raise ValueError(f"tie_break 必须是 {STATES} 之一（收到 {tie_break!r}）")
+    buckets: dict[str, Counter] = {}
+    for effective, state in effective_states.items():
+        if state not in STATES:
+            raise ValueError(f"未知状态 {state!r}（生效日 {effective}）")
+        buckets.setdefault(str(effective)[:7], Counter())[state] += 1
+    out: dict[str, str] = {}
+    for month, counts in buckets.items():
+        top = max(counts.values())
+        winners = [state for state in STATES if counts.get(state, 0) == top]
+        out[month] = winners[0] if len(winners) == 1 else tie_break
+    return out
+
+
+def forming_inputs(
+    closes: list[float],
+    volumes: list[float] | None,
+    live_close: float | None,
+    live_volume: float | None,
+    window: int = DEFAULT_WINDOW,
+    *,
+    volume_plausibility: tuple[float, float] = (0.1, 10.0),
+) -> dict[str, Any]:
+    """日内形成中一行的三输入：历史 + live 拼接后按同一公式滚动到尾位。
+
+    返回 {ret, vol, vratio, ok, notes}。``ok=False``（历史不足 window 或 live 缺失）时
+    classify 将按 NaN 规则给 neutral；notes 如实记录原因（绝不静默假值）。
+    """
+    notes: list[str] = []
+    use_vol = list(volumes) if volumes and len(volumes) == len(closes) else [1.0] * len(closes)
+    if live_close is None or live_close <= 0:
+        return {"ret": None, "vol": None, "vratio": None, "ok": False, "notes": ["no_live_close"]}
+    if len(closes) < window:
+        return {"ret": None, "vol": None, "vratio": None, "ok": False, "notes": ["history_short"]}
+    ret = _roll_ret_with_live(closes, live_close, window)
+    vol = _roll_std_with_live(closes, live_close, window)
+    vratio: float | None = None
+    if live_volume is not None and live_volume > 0:
+        # 自含当日（与 pandas volume/volume.rolling(w).mean() 一致）：窗内 w-1 历史 + live
+        denom = (sum(use_vol[-(window - 1):]) + float(live_volume)) / window if window > 1 else float(live_volume)
+        if denom > 0:
+            ratio = float(live_volume) / denom
+            lo, hi = volume_plausibility
+            if lo <= ratio <= hi:
+                vratio = ratio
+            else:
+                notes.append(f"volume_ratio_implausible({ratio:.2f})——量纲/单位可疑，弃用该输入")
+    else:
+        notes.append("no_live_volume")
+    return {"ret": ret, "vol": vol, "vratio": vratio, "ok": True, "notes": notes}
+
+
+# ── 滚动统计（列表版，与 pandas rolling 逐式对齐：ret=shift(w)；vol 取 w 个日收益；vratio 自含当日）──
+
+
+def _roll_ret(closes: list[float], i: int, window: int) -> float | None:
+    if i - window < 0:
+        return None
+    base = closes[i - window]
+    return (closes[i] / base - 1.0) if base else None
+
+
+def _roll_ret_with_live(closes: list[float], live_close: float, window: int) -> float | None:
+    if len(closes) < window:
+        return None
+    base = closes[-window]
+    return (live_close / base - 1.0) if base else None
+
+
+def _std_of(vals: list[float]) -> float | None:
+    rets = [(vals[k] / vals[k - 1] - 1.0) for k in range(1, len(vals)) if vals[k - 1]]
+    if len(rets) < 2:
+        return None
+    mean = sum(rets) / len(rets)
+    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+    return math.sqrt(var)
+
+
+def _roll_std(closes: list[float], i: int, window: int) -> float | None:
+    """行 i 的滚动波动：pandas daily_ret.rolling(w).std() → 需 closes[i-w .. i]（w+1 值）。"""
+    if i - window < 0:
+        return None
+    return _std_of(closes[i - window: i + 1])
+
+
+def _roll_std_with_live(closes: list[float], live_close: float, window: int) -> float | None:
+    """含 live 当日：vals = closes[-(w)..-1] + [live]（w+1 值 → w 个日收益）。"""
+    vals = closes[-window:] + [float(live_close)] if window <= len(closes) else closes + [float(live_close)]
+    return _std_of(vals)
+
+
+def _roll_vratio(volumes: list[float], i: int, window: int) -> float | None:
+    """行 i 的 vratio：pandas volume/volume.rolling(w).mean() —— 均值**自含当日**。"""
+    if i - window + 1 < 0:
+        return None
+    mean = sum(volumes[i - window + 1: i + 1]) / window
+    if mean <= 0:
+        return None
+    return volumes[i] / mean

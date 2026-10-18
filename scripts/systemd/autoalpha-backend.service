@@ -1,0 +1,33 @@
+[Unit]
+Description=AutoAlpha local factor-mining backend
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=qusong
+Group=qusong
+Environment=HOME=/home/qusong
+Environment=VENV=/home/qusong/autoalpha-venv312
+Environment=HOST=0.0.0.0
+Environment=PORT=8001
+Environment=QM_RUNTIME_ENV_FILE=/home/qusong/.config/autoalpha/runtime.env
+Environment=AUTH_DISABLED=1
+Environment=ENABLE_STARTUP_DDL=1
+WorkingDirectory=/mnt/d/git/autoalpha
+ExecStart=/usr/bin/bash /mnt/d/git/autoalpha/scripts/wsl/start-dev.sh
+Restart=always
+RestartSec=5s
+TimeoutStopSec=45s
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/data/alpha_agent_logs /data/quantcustom /data/qlib/cn_data
+
+[Install]
+WantedBy=multi-user.target

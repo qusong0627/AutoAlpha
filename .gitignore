@@ -1,0 +1,25 @@
+# Local credentials and environment overlays. Keep only checked-in examples.
+**/.env
+**/.env.*
+!**/.env.example
+**/runtime.env
+**/runtime.env.*
+!config/runtime.env.example
+*.pem
+*.key
+
+# Python caches and local virtual environments.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Frontend dependencies and generated build output.
+**/node_modules/
+/web/dist/
+
+# Runtime output and local-only editor state.
+/log/
+**/logs/
+/.vscode/
+

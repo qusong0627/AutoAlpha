@@ -1,0 +1,3208 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import math
+import os
+import shutil
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from sqlalchemy import text
+
+from backend.shared.cos_service import get_cos_service
+from backend.shared.database_manager_v2 import get_session
+from backend.shared.database_pool import get_db
+from backend.shared.model_algorithm_meta import (
+    build_algorithm_metadata,
+    build_algorithm_metrics,
+    build_child_metrics_json,
+    comparison_index,
+    read_xgboost_best_iteration,
+)
+from backend.shared.model_retirement import AUDIT_ACTION_ARCHIVE
+from backend.shared.model_rollout_store import latest_promotion_of
+
+logger = logging.getLogger(__name__)
+
+_ALLOWED_MODEL_STATUSES = {
+    "candidate",
+    "syncing",
+    "ready",
+    "active",
+    "archived",
+    "failed",
+}
+_READY_STATUSES = {"ready", "active"}
+_SYSTEM_MODEL_METADATA = {"system_default": True, "readonly": True}
+
+# 展示名长度上限（用户态重命名；与前端 maxLength 同口径）。
+# 只约束展示层字段，不约束 model_id（model_id 另有 ASCII 校验）。
+MAX_DISPLAY_NAME_LENGTH = 80
+
+
+@dataclass
+class ResolvedModel:
+    effective_model_id: str
+    model_source: str
+    fallback_used: bool
+    fallback_reason: str
+    storage_path: str
+    model_file: str
+    status: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "effective_model_id": self.effective_model_id,
+            "model_source": self.model_source,
+            "fallback_used": self.fallback_used,
+            "fallback_reason": self.fallback_reason,
+            "storage_path": self.storage_path,
+            "model_file": self.model_file,
+            "status": self.status,
+        }
+
+
+_MARKET_ALIASES: dict[str, frozenset[str]] = {
+    # 除市场名外，同时收录**交易所/日历代号**：训练与推理链路里的日历名是
+    # SSE/HKEX/NYSE 三套（见 routers/model_training._MARKET_CALENDAR），
+    # 漏收会让这些值静默落到默认的 CN（曾导致美股被识别成 A 股）。
+    "CN": frozenset({"CN", "A", "A_SHARE", "A股", "CHINA", "SSE", "XSHG", "SZSE"}),
+    "HK": frozenset({"HK", "HONG_KONG", "港股", "HKEX", "XHKG"}),
+    "US": frozenset({"US", "美股", "NYSE", "XNYS", "NASDAQ", "XNAS", "AMEX"}),
+    "CRYPTO": frozenset({"CRYPTO", "加密", "加密货币", "24/7"}),
+    "FUTURES": frozenset({"FUTURES", "期货", "CME", "SHFE"}),
+}
+
+
+def _canonical_market(value: Any) -> str:
+    """市场标识规范化（缺省/未知一律 CN）。"""
+    raw = str(value or "").upper().strip()
+    if not raw:
+        return "CN"
+    for canonical, hits in _MARKET_ALIASES.items():
+        if raw in hits:
+            return canonical
+    return "CN"
+
+
+def _model_market_of(model: dict[str, Any]) -> str:
+    """模型记录 → 市场（metadata_json.market > context.market > model_id mdl_{market}_ 前缀）。"""
+    meta = model.get("metadata_json") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:  # noqa: BLE001
+            meta = {}
+    raw = ""
+    if isinstance(meta, dict):
+        raw = str(meta.get("market") or "")
+        if not raw:
+            ctx = meta.get("context")
+            if isinstance(ctx, dict):
+                raw = str(ctx.get("market") or "")
+    if not raw:
+        mid = str(model.get("model_id") or "").lower()
+        for market in ("hk", "us", "crypto", "futures", "cn"):
+            if f"mdl_{market}_" in mid:
+                raw = market
+                break
+    return _canonical_market(raw)
+
+
+def _majority_choice(values: list[str], *, prefer: str = "") -> str | None:
+    """多数票（并列时优先 ``prefer``，否则取字典序最小者）—— 确定性，无随机。"""
+    clean = [str(v) for v in values if str(v or "").strip()]
+    if not clean:
+        return None
+    counts: dict[str, int] = {}
+    for v in clean:
+        counts[v] = counts.get(v, 0) + 1
+    top = max(counts.values())
+    candidates = sorted(v for v, c in counts.items() if c == top)
+    if prefer and prefer in candidates:
+        return prefer
+    return candidates[0]
+
+
+def _merge_field_sources(
+    maps: list[dict[str, Any]], warnings: list[str]
+) -> dict[str, str]:
+    """合并成员的 ``factor_field_sources``（逐键多数票；冲突对账后可见）。"""
+    per_key: dict[str, list[str]] = {}
+    for m in maps:
+        if not isinstance(m, dict):
+            continue
+        for k, v in m.items():
+            per_key.setdefault(str(k), []).append(str(v))
+    merged: dict[str, str] = {}
+    conflicts: list[str] = []
+    for key in sorted(per_key):
+        vals = per_key[key]
+        merged[key] = _majority_choice(vals) or vals[0]
+        if len(set(vals)) > 1:
+            conflicts.append(key)
+    if conflicts:
+        warnings.append(f"factor_field_sources_conflict: {conflicts[:8]}")
+    return merged
+
+
+def _inherit_data_plane_from_members(
+    member_metas: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[str]]:
+    """融合模型数据面继承：成员 metadata 多数票，**绝不硬编码**。
+
+    历史缺陷（2026-10-09 E2E 实锤）：``register_ensemble_model`` 硬编码
+    ``data_source="parquet"`` 的融合模型，runner 会路由到 feature_snapshots
+    （本机停更于 2026-08）并以其最新日期为推理日 —— 「能推理但读陈旧数据」。
+    成员的 data_source=quantdb_factors 时，融合模型必须继承同一数据面
+    （含 quantdb_dir pin / factor_source / 字段映射 / schema 哈希），否则
+    模板取数、就绪检查、日期回退三处口径不一致。
+
+    Returns:
+        (要并入融合 metadata 的键值, 警告列表)。
+    """
+    warnings: list[str] = []
+    out: dict[str, Any] = {}
+    sources = [str(m.get("data_source") or "") for m in member_metas]
+    # 平票时倾向 quantdb_factors：该面带 pin 与就绪检查，可对账；parquet 面
+    # 无版本信息，误选只会静默读陈旧快照（本函数要消灭的症状）。
+    data_source = _majority_choice(sources, prefer="quantdb_factors") or "parquet"
+    out["data_source"] = data_source
+    distinct = sorted({v for v in sources if v})
+    if len(distinct) > 1:
+        warnings.append(f"mixed_data_source: {distinct} (取 {data_source})")
+
+    if data_source == "quantdb_factors":
+        for key in ("quantdb_dir", "factor_source", "factor_schema_hash"):
+            chosen = _majority_choice([str(m.get(key) or "") for m in member_metas])
+            if chosen:
+                out[key] = chosen
+            vals = sorted({str(m.get(key) or "") for m in member_metas} - {""})
+            if len(vals) > 1:
+                warnings.append(f"mixed_{key}: {vals} (取 {chosen or '缺省'})")
+        merged = _merge_field_sources(
+            [m.get("factor_field_sources") or {} for m in member_metas], warnings
+        )
+        if merged:
+            out["factor_field_sources"] = merged
+    elif data_source == "parquet":
+        # parquet 面沿用成员的 data_dir 位置（相对路径由 runner 重定位）
+        chosen_dir = _majority_choice(
+            [str(m.get("data_dir") or "") for m in member_metas]
+        )
+        if chosen_dir:
+            out["data_dir"] = chosen_dir
+    return out, warnings
+
+
+class ModelRegistryService:
+    def __init__(self) -> None:
+        raw_user_models_root = Path(os.getenv("USER_MODELS_ROOT", "models/users"))
+        self.user_models_root = (
+            raw_user_models_root
+            if raw_user_models_root.is_absolute()
+            else Path("/app") / raw_user_models_root
+        )
+        self.primary_model_id = os.getenv("PRIMARY_MODEL_ID", "")
+        self.fallback_model_id = os.getenv("FALLBACK_MODEL_ID", "")
+        self.primary_model_dir = str(
+            os.getenv("MODELS_PRODUCTION", "/app/models/production")
+        )
+        self.fallback_model_dir = str(os.getenv("MODELS_FALLBACK_PRODUCTION", ""))
+        self.production_models_root = Path(self.primary_model_dir)
+
+    async def ensure_tables(self) -> None:
+        stmts = [
+            """
+            CREATE TABLE IF NOT EXISTS qm_user_models (
+                tenant_id VARCHAR(64) NOT NULL,
+                user_id VARCHAR(64) NOT NULL,
+                model_id VARCHAR(128) NOT NULL,
+                source_run_id VARCHAR(64),
+                status VARCHAR(32) NOT NULL DEFAULT 'candidate',
+                storage_path TEXT,
+                model_file VARCHAR(255),
+                metadata_json JSONB,
+                metrics_json JSONB,
+                is_default BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                activated_at TIMESTAMPTZ,
+                PRIMARY KEY (tenant_id, user_id, model_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS qm_strategy_model_bindings (
+                tenant_id VARCHAR(64) NOT NULL,
+                user_id VARCHAR(64) NOT NULL,
+                strategy_id VARCHAR(128) NOT NULL,
+                model_id VARCHAR(128) NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (tenant_id, user_id, strategy_id)
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_qm_user_models_user_status
+            ON qm_user_models (tenant_id, user_id, status, updated_at DESC)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_qm_strategy_model_bindings_model
+            ON qm_strategy_model_bindings (tenant_id, user_id, model_id)
+            """,
+            # 默认模型唯一性**按市场**（§5.5）：口径 = qm_market_of(metadata_json)
+            # （与下方 _canonical_market 等价，见 data/upgrade_v1.1.4.sql 同源 DDL）。
+            # 启动期这里还主动 DROP 旧全局索引——进程内旧代码的 ensure 会把它复活，
+            # 不主动清会让多市场默认互相顶掉（P2 验收③演练实测）。全部幂等。
+            """
+            CREATE OR REPLACE FUNCTION qm_market_of(meta jsonb) RETURNS text
+            LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+                SELECT CASE
+                    WHEN m IN ('HK', 'HONG_KONG', '港股', 'HKEX', 'XHKG') THEN 'HK'
+                    WHEN m IN ('US', '美股', 'NYSE', 'XNYS', 'NASDAQ', 'XNAS', 'AMEX') THEN 'US'
+                    WHEN m IN ('CRYPTO', '加密', '加密货币', '24/7') THEN 'CRYPTO'
+                    WHEN m IN ('FUTURES', '期货', 'CME', 'SHFE') THEN 'FUTURES'
+                    ELSE 'CN'
+                END
+                FROM (
+                    SELECT upper(btrim(coalesce(
+                               nullif(meta ->> 'market', ''),
+                               nullif(meta -> 'context' ->> 'market', '')
+                           , ''))) AS m
+                ) t
+            $$
+            """,
+            """
+            DROP INDEX IF EXISTS uq_qm_user_models_default_per_user
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_qm_user_models_default_per_market
+            ON qm_user_models (tenant_id, user_id, qm_market_of(metadata_json))
+            WHERE is_default = TRUE
+            """,
+            """
+            DELETE FROM qm_user_models
+            WHERE model_id IN ('model_qlib', 'alpha158', 'sys-model_qlib', 'sys-alpha158')
+            """,
+        ]
+        async with get_session() as session:
+            for stmt in stmts:
+                await session.execute(text(stmt))
+
+    @staticmethod
+    def _normalize_owner(*, tenant_id: str, user_id: str) -> tuple[str, str]:
+        tenant = str(tenant_id or "default").strip() or "default"
+        user = str(user_id or "").strip()
+        if not user:
+            raise ValueError("user_id is required")
+        return tenant, user
+
+    @staticmethod
+    def _parse_json_field(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                payload = json.loads(value)
+                if isinstance(payload, dict):
+                    return payload
+            except Exception:
+                return {}
+        return {}
+
+    def _row_to_model(self, row: dict[str, Any]) -> dict[str, Any]:
+        metadata_json = self._parse_json_field(row.get("metadata_json"))
+        metrics_json = self._parse_json_field(row.get("metrics_json"))
+        return {
+            "tenant_id": str(row.get("tenant_id") or "default"),
+            "user_id": str(row.get("user_id") or ""),
+            "model_id": str(row.get("model_id") or ""),
+            "source_run_id": str(row.get("source_run_id") or ""),
+            "status": str(row.get("status") or ""),
+            "storage_path": str(row.get("storage_path") or ""),
+            "model_file": str(row.get("model_file") or ""),
+            "metadata_json": metadata_json,
+            "metrics_json": metrics_json,
+            "is_default": bool(row.get("is_default")),
+            "created_at": row.get("created_at").isoformat()
+            if row.get("created_at")
+            else None,
+            "updated_at": row.get("updated_at").isoformat()
+            if row.get("updated_at")
+            else None,
+            "activated_at": row.get("activated_at").isoformat()
+            if row.get("activated_at")
+            else None,
+        }
+
+    def _find_system_model_file(
+        self, dir_path: Path, metadata: dict[str, Any] | None = None
+    ) -> str:
+        candidates: list[str] = []
+        meta = metadata if isinstance(metadata, dict) else {}
+        files = meta.get("files") if isinstance(meta.get("files"), dict) else {}
+        if isinstance(files, dict):
+            checkpoint = (
+                files.get("model_checkpoint")
+                or files.get("model_file")
+                or files.get("checkpoint")
+            )
+            if isinstance(checkpoint, str) and checkpoint.strip():
+                candidates.append(checkpoint.strip())
+        for key in ("model_file", "model_checkpoint", "checkpoint"):
+            value = meta.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip())
+        for ext in ("bin", "txt", "pkl", "pth", "onnx", "pt", "lgb", "xgb", "cbm"):
+            candidates.append(f"model.{ext}")
+        for name in candidates:
+            if (dir_path / name).is_file():
+                return name
+        return candidates[0] if candidates else "model.bin"
+
+    async def _resolve_system_model_record(
+        self, explicit_id: str
+    ) -> dict[str, Any] | None:
+        raw = str(explicit_id or "").strip()
+        if not raw:
+            return None
+        if raw.startswith("sys-"):
+            raw = raw[4:]
+        dir_path = self.production_models_root / raw
+        if not dir_path.exists() or not dir_path.is_dir():
+            return None
+
+        meta_path = dir_path / "metadata.json"
+        metadata: dict[str, Any] = {}
+        if meta_path.is_file():
+            try:
+                metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                metadata = {}
+        files = metadata.get("files") if isinstance(metadata.get("files"), dict) else {}
+        display_name = ""
+        model_info = (
+            metadata.get("model_info")
+            if isinstance(metadata.get("model_info"), dict)
+            else {}
+        )
+        if isinstance(model_info, dict):
+            display_name = str(
+                model_info.get("name") or model_info.get("display_name") or ""
+            ).strip()
+        if not display_name:
+            display_name = str(metadata.get("display_name") or raw)
+
+        if raw == Path(self.primary_model_dir).name:
+            canonical_model_id = self.primary_model_id
+        elif raw == Path(self.fallback_model_dir).name:
+            canonical_model_id = self.fallback_model_id
+        else:
+            canonical_model_id = f"sys-{raw}"
+
+        context = (
+            metadata.get("context") if isinstance(metadata.get("context"), dict) else {}
+        )
+        return {
+            "model_id": canonical_model_id,
+            "dir_name": raw,
+            "tenant_id": "system",
+            "user_id": "system",
+            "status": "active",
+            "storage_path": str(dir_path),
+            "model_file": self._find_system_model_file(dir_path, metadata),
+            "display_name": display_name,
+            "metadata_json": {
+                "display_name": display_name,
+                "model_type": metadata.get("model_type")
+                or metadata.get("framework")
+                or "",
+                "feature_count": metadata.get("feature_count"),
+                "features": metadata.get("feature_columns", []),
+                "performance_metrics": metadata.get("performance_metrics", {}),
+                "context": context,
+                "train_start": metadata.get("train_start"),
+                "train_end": metadata.get("train_end"),
+                "valid_start": metadata.get("valid_start"),
+                "valid_end": metadata.get("valid_end"),
+                "test_start": metadata.get("test_start"),
+                "test_end": metadata.get("test_end"),
+            },
+            "metrics_json": metadata.get("performance_metrics", {}),
+        }
+
+    async def _materialize_system_model_record(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        system_record: dict[str, Any],
+        is_default: bool = False,
+        activated_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        tenant, user = self._normalize_owner(tenant_id=tenant_id, user_id=user_id)
+        now = datetime.now(timezone.utc)
+        model_id = str(system_record.get("model_id") or "").strip()
+        if not model_id:
+            raise ValueError("system model id is required")
+
+        metadata_json = dict(system_record.get("metadata_json") or {})
+        metadata_json = {
+            **metadata_json,
+            "system_default": True,
+            "readonly": True,
+        }
+        metrics_json = system_record.get("metrics_json") or {}
+
+        async with get_session() as session:
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO qm_user_models (
+                        tenant_id, user_id, model_id, source_run_id, status, storage_path, model_file,
+                        metadata_json, metrics_json, is_default, created_at, updated_at, activated_at
+                    ) VALUES (
+                        :tenant_id, :user_id, :model_id, NULL, :status, :storage_path, :model_file,
+                        CAST(:metadata_json AS JSONB), CAST(:metrics_json AS JSONB), :is_default,
+                        :created_at, :updated_at, :activated_at
+                    )
+                    ON CONFLICT (tenant_id, user_id, model_id)
+                    DO UPDATE SET
+                        status = EXCLUDED.status,
+                        storage_path = EXCLUDED.storage_path,
+                        model_file = EXCLUDED.model_file,
+                        metadata_json = EXCLUDED.metadata_json,
+                        metrics_json = EXCLUDED.metrics_json,
+                        is_default = EXCLUDED.is_default,
+                        activated_at = EXCLUDED.activated_at,
+                        updated_at = EXCLUDED.updated_at
+                    """
+                ),
+                {
+                    "tenant_id": tenant,
+                    "user_id": user,
+                    "model_id": model_id,
+                    "status": str(system_record.get("status") or "active"),
+                    "storage_path": str(system_record.get("storage_path") or ""),
+                    "model_file": str(system_record.get("model_file") or "model.bin"),
+                    "metadata_json": json.dumps(metadata_json, ensure_ascii=False),
+                    "metrics_json": json.dumps(metrics_json, ensure_ascii=False),
+                    "is_default": bool(is_default),
+                    "created_at": now,
+                    "updated_at": now,
+                    "activated_at": activated_at,
+                },
+            )
+
+        model = await self.get_model(tenant_id=tenant, user_id=user, model_id=model_id)
+        if model is None:
+            raise ValueError("system model materialization failed")
+        return model
+
+    async def _ensure_system_default_record(
+        self, *, tenant_id: str, user_id: str
+    ) -> None:
+        # OSS 部署未配置内置生产模型时 PRIMARY_MODEL_ID 为空；不能将空
+        # 字符串注册为模型，否则用户每次登录都会看到一条无名称的“模型”。
+        if not self.primary_model_id.strip():
+            return
+        tenant, user = self._normalize_owner(tenant_id=tenant_id, user_id=user_id)
+        now = datetime.now(timezone.utc)
+        async with get_session() as session:
+            exists = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT 1
+                        FROM qm_user_models
+                        WHERE tenant_id = :tenant_id AND user_id = :user_id AND model_id = :model_id
+                        LIMIT 1
+                        """
+                    ),
+                    {
+                        "tenant_id": tenant,
+                        "user_id": user,
+                        "model_id": self.primary_model_id,
+                    },
+                )
+            ).first()
+            if exists:
+                return
+
+            current_default = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT 1
+                        FROM qm_user_models
+                        WHERE tenant_id = :tenant_id AND user_id = :user_id AND is_default = TRUE
+                        LIMIT 1
+                        """
+                    ),
+                    {"tenant_id": tenant, "user_id": user},
+                )
+            ).first()
+
+            # 优先从 system 记录读取完整 metadata，回退到文件，最后用 stub
+            system_row = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT metadata_json, metrics_json, storage_path, model_file
+                        FROM qm_user_models
+                        WHERE tenant_id = :tenant_id AND user_id = 'system' AND model_id = :model_id
+                        LIMIT 1
+                        """
+                    ),
+                    {"tenant_id": tenant, "model_id": self.primary_model_id},
+                )
+            ).first()
+
+            if system_row and system_row[0]:
+                rich_metadata = dict(system_row[0])
+                rich_metadata.update({"system_default": True, "readonly": True})
+                rich_metrics = dict(system_row[1]) if system_row[1] else {}
+                system_storage = system_row[2] or self.primary_model_dir
+                system_model_file = system_row[3] or "model.lgb"
+            else:
+                # 回退：尝试从文件读取
+                meta_file = Path(self.primary_model_dir) / "metadata.json"
+                if meta_file.exists():
+                    try:
+                        file_meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                        rich_metadata = {
+                            **file_meta,
+                            "system_default": True,
+                            "readonly": True,
+                        }
+                        rich_metrics = file_meta.get("metrics", {})
+                    except Exception:
+                        rich_metadata = _SYSTEM_MODEL_METADATA.copy()
+                        rich_metrics = {}
+                else:
+                    rich_metadata = _SYSTEM_MODEL_METADATA.copy()
+                    rich_metrics = {}
+                system_storage = self.primary_model_dir
+                system_model_file = "model.lgb"
+
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO qm_user_models (
+                        tenant_id, user_id, model_id, source_run_id, status, storage_path, model_file,
+                        metadata_json, metrics_json, is_default, created_at, updated_at, activated_at
+                    ) VALUES (
+                        :tenant_id, :user_id, :model_id, NULL, 'active', :storage_path, :model_file,
+                        CAST(:metadata_json AS JSONB), CAST(:metrics_json AS JSONB), :is_default,
+                        :created_at, :updated_at, :activated_at
+                    )
+                    """
+                ),
+                {
+                    "tenant_id": tenant,
+                    "user_id": user,
+                    "model_id": self.primary_model_id,
+                    "storage_path": system_storage,
+                    "model_file": system_model_file,
+                    "metadata_json": json.dumps(rich_metadata, ensure_ascii=False),
+                    "metrics_json": json.dumps(rich_metrics, ensure_ascii=False),
+                    "is_default": bool(not current_default),
+                    "created_at": now,
+                    "updated_at": now,
+                    "activated_at": now if not current_default else None,
+                },
+            )
+
+    async def list_models(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        include_archived: bool = False,
+        market: str | None = None,
+    ) -> list[dict[str, Any]]:
+        tenant, user = self._normalize_owner(tenant_id=tenant_id, user_id=user_id)
+        where_extra = "" if include_archived else "AND status <> 'archived'"
+        params: dict[str, Any] = {"tenant_id": tenant, "user_id": user}
+        if market:
+            market_canonical = _canonical_market(market)
+            where_extra += " AND qm_market_of(metadata_json) = :market"
+            params["market"] = market_canonical
+        async with get_session(read_only=True) as session:
+            rows = (
+                (
+                    await session.execute(
+                        text(
+                            f"""
+                        SELECT tenant_id, user_id, model_id, source_run_id, status, storage_path, model_file,
+                               metadata_json, metrics_json, is_default, created_at, updated_at, activated_at
+                        FROM qm_user_models
+                        WHERE tenant_id = :tenant_id AND user_id = :user_id
+                          AND BTRIM(COALESCE(model_id, '')) <> '' {where_extra}
+                        ORDER BY is_default DESC, updated_at DESC, created_at DESC
+                        """
+                        ),
+                        params,
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        return [self._row_to_model(dict(row)) for row in rows]
+
+    async def scan_ensemble_models(self) -> list[dict[str, Any]]:
+        """全部租户的融合模型行（P2-4 周期权重刷新的扫描面）。
+
+        与 ``list_models`` 不同，这里是**跨用户**的平台级扫描，只收 ready/active。
+        判据两条并列（实测缺一不可）：``is_ensemble=true`` **且** 带
+        ``source_model_ids`` —— 训练管线落库的 stacking 模型也会带
+        ``is_ensemble=true``（模型族意义上的「集成」），但它不是
+        register_ensemble_model 产出的融合模型，没有 weight_snapshot 可刷。
+        """
+        async with get_session(read_only=True) as session:
+            rows = (
+                (
+                    await session.execute(
+                        text(
+                            """
+                        SELECT tenant_id, user_id, model_id, status, storage_path, metadata_json
+                        FROM qm_user_models
+                        WHERE status IN ('ready', 'active')
+                          AND metadata_json ->> 'is_ensemble' = 'true'
+                          AND metadata_json ? 'source_model_ids'
+                        ORDER BY updated_at DESC
+                        """
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        return [
+            {
+                **dict(row),
+                "metadata_json": self._parse_json_field(row.get("metadata_json")),
+            }
+            for row in rows
+        ]
+
+    async def get_model(
+        self, *, tenant_id: str, user_id: str, model_id: str
+    ) -> dict[str, Any] | None:
+        tenant, user = self._normalize_owner(tenant_id=tenant_id, user_id=user_id)
+        async with get_session(read_only=True) as session:
+            row = (
+                (
+                    await session.execute(
+                        text(
+                            """
+                        SELECT tenant_id, user_id, model_id, source_run_id, status, storage_path, model_file,
+                               metadata_json, metrics_json, is_default, created_at, updated_at, activated_at
+                        FROM qm_user_models
+                        WHERE tenant_id = :tenant_id AND user_id = :user_id AND model_id = :model_id
+                        LIMIT 1
+                        """
+                        ),
+                        {
+                            "tenant_id": tenant,
+                            "user_id": user,
+                            "model_id": str(model_id),
+                        },
+                    )
+                )
+                .mappings()
+                .first()
+            )
+        return self._row_to_model(dict(row)) if row else None
+
+    async def get_default_model(
+        self, *, tenant_id: str, user_id: str, market: str | None = None
+    ) -> dict[str, Any] | None:
+        tenant, user = self._normalize_owner(tenant_id=tenant_id, user_id=user_id)
+        market_clause = ""
+        params: dict[str, Any] = {"tenant_id": tenant, "user_id": user}
+        if market:
+            market_clause = " AND qm_market_of(metadata_json) = :market"
+            params["market"] = _canonical_market(market)
+        async with get_session(read_only=True) as session:
+            row = (
+                (
+                    await session.execute(
+                        text(
+                            f"""
+                        SELECT tenant_id, user_id, model_id, source_run_id, status, storage_path, model_file,
+                               metadata_json, metrics_json, is_default, created_at, updated_at, activated_at
+                        FROM qm_user_models
+                        WHERE tenant_id = :tenant_id AND user_id = :user_id
+                          AND is_default = TRUE AND status IN ('ready', 'active'){market_clause}
+                        ORDER BY activated_at DESC NULLS LAST, updated_at DESC
+                        LIMIT 1
+                        """
+                        ),
+                        params,
+                    )
+                )
+                .mappings()
+                .first()
+            )
+        return self._row_to_model(dict(row)) if row else None
+
+    async def set_default_model(
+        self, *, tenant_id: str, user_id: str, model_id: str
+    ) -> dict[str, Any]:
+        tenant, user = self._normalize_owner(tenant_id=tenant_id, user_id=user_id)
+        mid = str(model_id).strip()
+        if not mid:
+            raise ValueError("model_id is required")
+
+        now = datetime.now(timezone.utc)
+        async with get_session() as session:
+            target = (
+                (
+                    await session.execute(
+                        text(
+                            """
+                        SELECT model_id, status, metadata_json
+                        FROM qm_user_models
+                        WHERE tenant_id = :tenant_id AND user_id = :user_id AND model_id = :model_id
+                        LIMIT 1
+                        """
+                        ),
+                        {"tenant_id": tenant, "user_id": user, "model_id": mid},
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if not target:
+                system_record = await self._resolve_system_model_record(mid)
+                if system_record is not None:
+                    await self._materialize_system_model_record(
+                        tenant_id=tenant,
+                        user_id=user,
+                        system_record=system_record,
+                        is_default=False,
+                        activated_at=None,
+                    )
+                    # 用 canonical model_id（可能与 mid 不同，如 sys-xxx → xxx）
+                    canonical_mid = str(system_record.get("model_id") or mid)
+                    mid = canonical_mid
+                    target = (
+                        (
+                            await session.execute(
+                                text(
+                                    """
+                                SELECT model_id, status, metadata_json
+                                FROM qm_user_models
+                                WHERE tenant_id = :tenant_id AND user_id = :user_id AND model_id = :model_id
+                                LIMIT 1
+                                """
+                                ),
+                                {"tenant_id": tenant, "user_id": user, "model_id": mid},
+                            )
+                        )
+                        .mappings()
+                        .first()
+                    )
+            if not target:
+                raise ValueError("model not found")
+            status = str(target.get("status") or "")
+            if status not in _READY_STATUSES:
+                raise ValueError("model is not ready")
+
+            await session.execute(
+                text(
+                    """
+                    UPDATE qm_user_models
+                    SET is_default = FALSE, updated_at = :updated_at
+                    WHERE tenant_id = :tenant_id AND user_id = :user_id AND is_default = TRUE
+                    """
+                ),
+                {"tenant_id": tenant, "user_id": user, "updated_at": now},
+            )
+
+            # 清除 system_default 标记，表明这是用户主动设置的默认模型
+            target_metadata = target.get("metadata_json") or {}
+            if isinstance(target_metadata, str):
+                try:
+                    target_metadata = json.loads(target_metadata)
+                except Exception:
+                    target_metadata = {}
+            elif not isinstance(target_metadata, dict):
+                target_metadata = {}
+            cleaned_metadata = {
+                k: v
+                for k, v in target_metadata.items()
+                if k not in ("system_default", "readonly")
+            }
+
+            await session.execute(
+                text(
+                    """
+                    UPDATE qm_user_models
+                    SET is_default = TRUE, activated_at = :activated_at, updated_at = :updated_at,
+                        metadata_json = CAST(:metadata_json AS JSONB)
+                    WHERE tenant_id = :tenant_id AND user_id = :user_id AND model_id = :model_id
+                    """
+                ),
+                {
+                    "tenant_id": tenant,
+                    "user_id": user,
+                    "model_id": mid,
+                    "activated_at": now,
+                    "updated_at": now,
+                    "metadata_json": json.dumps(cleaned_metadata, ensure_ascii=False),
+                },
+            )
+
+        model = await self.get_model(tenant_id=tenant, user_id=user, model_id=mid)
+        if model is None:
+            raise ValueError("model not found after update")
+        return model
+
+    def _resolve_owned_model_dir(self, model: dict[str, Any]) -> Path | None:
+        """storage_path → 用户模型根内的受控目录；越界/缺失一律 None（防任意路径写）。"""
+        raw = str(model.get("storage_path") or "").strip()
+        if not raw:
+            return None
+        path = Path(raw)
+        if not path.is_absolute():
+            path = Path("/app") / path
+        try:
+            resolved = path.resolve()
+            root = Path(self.user_models_root).resolve()
+        except OSError:
+            return None
+        if resolved != root and root not in resolved.parents:
+            return None
+        return resolved
+
+    def _read_disk_metadata(self, model: dict[str, Any]) -> dict[str, Any] | None:
+        """读模型目录磁盘 metadata.json；目录/文件缺失或损坏 → None。"""
+        model_dir = self._resolve_owned_model_dir(model)
+        if model_dir is None:
+            return None
+        meta_path = model_dir / "metadata.json"
+        if not meta_path.is_file():
+            return None
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return meta if isinstance(meta, dict) else None
+
+    def _write_disk_display_name(self, model: dict[str, Any], name: str) -> bool:
+        """展示名双写磁盘 metadata.json（原子替换）；目录缺失跳过（返回 False）。"""
+        model_dir = self._resolve_owned_model_dir(model)
+        if model_dir is None or not model_dir.is_dir():
+            logger.warning(
+                "重命名跳过磁盘写入：模型目录缺失 %s", model.get("storage_path")
+            )
+            return False
+        meta = dict(self._read_disk_metadata(model) or {})
+        meta["display_name"] = name
+        meta["model_name"] = name
+        meta_path = model_dir / "metadata.json"
+        tmp_path = meta_path.with_name("metadata.json.tmp")
+        tmp_path.write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        os.replace(tmp_path, meta_path)
+        return True
+
+    async def update_display_name(
+        self, *, tenant_id: str, user_id: str, model_id: str, display_name: str
+    ) -> dict[str, Any] | None:
+        """重命名模型展示名（用户态）。
+
+        双写口径（改一处都不够）：前端模型管理列表读 DB `metadata_json`；
+        滚动训练派生描述（`model_recipe.py`）读磁盘 `metadata.json` 的
+        `model_name`。两份存储的 `display_name` 与 `model_name` 必须同步更新，
+        其余键（hub_name、market 等）原样保留。
+
+        model_id 不动：滚动训练校验器仅允许 ASCII，且 ID 已进各台账引用。
+        幂等：同名 = 空操作（不写盘、不落库）。写后回读复验两份存储。
+        返回更新后的模型记录；不存在 / 不属本人 → None；
+        名称非法 / 系统模型（readonly）→ ValueError。
+        """
+        tenant, user = self._normalize_owner(tenant_id=tenant_id, user_id=user_id)
+        mid = str(model_id).strip()
+        if not mid:
+            raise ValueError("model_id is required")
+        name = str(display_name or "").strip()
+        if not name:
+            raise ValueError("展示名不能为空")
+        if len(name) > MAX_DISPLAY_NAME_LENGTH:
+            raise ValueError(f"展示名过长（≤{MAX_DISPLAY_NAME_LENGTH} 字符）")
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+            raise ValueError("展示名不能包含控制字符")
+
+        model = await self.get_model(tenant_id=tenant, user_id=user, model_id=mid)
+        if model is None:
+            return None
+        metadata = (
+            model.get("metadata_json")
+            if isinstance(model.get("metadata_json"), dict)
+            else {}
+        )
+        if bool(metadata.get("readonly")):
+            raise ValueError("system model cannot be renamed")
+
+        def _both_keys_are(meta: dict[str, Any] | None, target: str) -> bool:
+            if not isinstance(meta, dict):
+                return False
+            return (
+                str(meta.get("display_name") or "").strip() == target
+                and str(meta.get("model_name") or "").strip() == target
+            )
+
+        disk_meta = self._read_disk_metadata(model)
+        if _both_keys_are(metadata, name) and (
+            disk_meta is None or _both_keys_are(disk_meta, name)
+        ):
+            return model
+
+        # 先盘后库：磁盘原子写失败会抛错且不留半态，此时 DB 保持旧值（两份不劈叉）
+        self._write_disk_display_name(model, name)
+
+        new_metadata = {**metadata, "display_name": name, "model_name": name}
+        now = datetime.now(timezone.utc)
+        async with get_session() as session:
+            await session.execute(
+                text(
+                    """
+                    UPDATE qm_user_models
+                    SET metadata_json = CAST(:metadata_json AS JSONB), updated_at = :updated_at
+                    WHERE tenant_id = :tenant_id AND user_id = :user_id AND model_id = :model_id
+                    """
+                ),
+                {
+                    "tenant_id": tenant,
+                    "user_id": user,
+                    "model_id": mid,
+                    "updated_at": now,
+                    "metadata_json": json.dumps(new_metadata, ensure_ascii=False),
+                },
+            )
+
+        # 写后回读复验：两份存储都要落成新名，否则算失败（不改测试，改实现）
+        readback = await self.get_model(tenant_id=tenant, user_id=user, model_id=mid)
+        if readback is None:
+            raise RuntimeError("重命名回读失败：模型记录消失")
+        if not _both_keys_are(readback.get("metadata_json"), name):
+            raise RuntimeError("重命名回读不一致（DB metadata_json）")
+        disk_readback = self._read_disk_metadata(readback)
+        if disk_readback is not None and not _both_keys_are(disk_readback, name):
+            raise RuntimeError("重命名回读不一致（磁盘 metadata.json）")
+        return readback
+
+    async def archive_model(
+        self, *, tenant_id: str, user_id: str, model_id: str
+    ) -> dict[str, Any]:
+        tenant, user = self._normalize_owner(tenant_id=tenant_id, user_id=user_id)
+        mid = str(model_id).strip()
+        if not mid:
+            raise ValueError("model_id is required")
+
+        model = await self.get_model(tenant_id=tenant, user_id=user, model_id=mid)
+        if model is None:
+            raise ValueError("model not found")
+        metadata = (
+            model.get("metadata_json")
+            if isinstance(model.get("metadata_json"), dict)
+            else {}
+        )
+        if bool(metadata.get("readonly")):
+            raise ValueError("system model cannot be archived")
+
+        now = datetime.now(timezone.utc)
+        async with get_session() as session:
+            await session.execute(
+                text(
+                    """
+                    UPDATE qm_user_models
+                    SET status = 'archived', is_default = FALSE, updated_at = :updated_at
+                    WHERE tenant_id = :tenant_id AND user_id = :user_id AND model_id = :model_id
+                    """
+                ),
+                {
+                    "tenant_id": tenant,
+                    "user_id": user,
+                    "model_id": mid,
+                    "updated_at": now,
+                },
+            )
+
+            # 回退只在**本市场**找继任（§5.5：CN 归档不许动 HK/US 的默认；
+            # 旧实现不分区，跨市场「最近更新 ready」会被错误扶上马）
+            market = _model_market_of(model)
+            default_exists = (
+                (
+                    await session.execute(
+                        text(
+                            """
+                        SELECT model_id
+                        FROM qm_user_models
+                        WHERE tenant_id = :tenant_id AND user_id = :user_id
+                          AND is_default = TRUE AND status IN ('ready', 'active')
+                          AND qm_market_of(metadata_json) = :market
+                        LIMIT 1
+                        """
+                        ),
+                        {"tenant_id": tenant, "user_id": user, "market": market},
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            # 继承任候选：跨分支供 §7 退役审计描述使用（回退去向写进 user_audit_logs）
+            successor: str | None = None
+            if not default_exists:
+                # ① 备任链优先：该模型经 rollout 晋升时记录的前任（§5.4）
+                promotion = await latest_promotion_of(
+                    mid, tenant_id=tenant, user_id=user, market=market, session=session
+                )
+                prior = str((promotion or {}).get("prior_default_model_id") or "")
+                if prior:
+                    prior_row = (
+                        await session.execute(
+                            text(
+                                """
+                                SELECT model_id FROM qm_user_models
+                                WHERE tenant_id = :tenant_id AND user_id = :user_id
+                                  AND model_id = :model_id
+                                  AND status IN ('ready', 'active')
+                                LIMIT 1
+                                """
+                            ),
+                            {
+                                "tenant_id": tenant,
+                                "user_id": user,
+                                "model_id": prior,
+                            },
+                        )
+                    ).first()
+                    if prior_row:
+                        successor = str(prior_row[0])
+                if successor is None:
+                    # ② 兜底：同市场最近更新的 ready（排除归档者）
+                    candidate = (
+                        (
+                            await session.execute(
+                                text(
+                                    """
+                                SELECT model_id
+                                FROM qm_user_models
+                                WHERE tenant_id = :tenant_id AND user_id = :user_id
+                                  AND status IN ('ready', 'active') AND model_id <> :archived_id
+                                  AND qm_market_of(metadata_json) = :market
+                                ORDER BY updated_at DESC
+                                LIMIT 1
+                                """
+                                ),
+                                {
+                                    "tenant_id": tenant,
+                                    "user_id": user,
+                                    "archived_id": mid,
+                                    "market": market,
+                                },
+                            )
+                        )
+                        .mappings()
+                        .first()
+                    )
+                    if candidate:
+                        successor = str(candidate.get("model_id"))
+                if successor:
+                    await session.execute(
+                        text(
+                            """
+                            UPDATE qm_user_models
+                            SET is_default = TRUE, activated_at = :activated_at, updated_at = :updated_at
+                            WHERE tenant_id = :tenant_id AND user_id = :user_id AND model_id = :model_id
+                              AND qm_market_of(metadata_json) = :market
+                            """
+                        ),
+                        {
+                            "tenant_id": tenant,
+                            "user_id": user,
+                            "model_id": successor,
+                            "market": market,
+                            "activated_at": now,
+                            "updated_at": now,
+                        },
+                    )
+
+            # §7 退役审计：归档与审计同事务落 user_audit_logs（谁归档了谁 + 默认回退去向）
+            if successor:
+                fallback = f"；默认位回退至 {successor}"
+            elif default_exists:
+                fallback = "；本市场已有默认，无回退动作"
+            else:
+                fallback = "；本市场无 ready 继任，默认位空缺"
+            await session.execute(
+                text(
+                    "INSERT INTO user_audit_logs "
+                    "(user_id, tenant_id, action, resource, resource_id, description, success, created_at) "
+                    "VALUES (:user_id, :tenant_id, :action, :resource, :resource_id, :description, TRUE, :created_at)"
+                ),
+                {
+                    "user_id": user,
+                    "tenant_id": tenant,
+                    "action": AUDIT_ACTION_ARCHIVE,
+                    "resource": "qm_user_models",
+                    "resource_id": mid,
+                    "description": (
+                        f"归档模型 {mid}（market={market}，原为默认={bool(model.get('is_default'))}）"
+                        + fallback
+                    )[:2000],
+                    "created_at": now,
+                },
+            )
+
+        archived = await self.get_model(tenant_id=tenant, user_id=user, model_id=mid)
+        if archived is None:
+            raise ValueError("archive result unavailable")
+        return archived
+
+    async def activate_model(
+        self, *, tenant_id: str, user_id: str, model_id: str
+    ) -> dict[str, Any]:
+        """手动激活 candidate 模型 → ready（软门禁触发的模型走此入口）。
+
+        仅 candidate 可激活；激活后保留 quality_warnings（供展示），用户可设默认。
+        """
+        tenant, user = self._normalize_owner(tenant_id=tenant_id, user_id=user_id)
+        mid = str(model_id).strip()
+        if not mid:
+            raise ValueError("model_id is required")
+
+        model = await self.get_model(tenant_id=tenant, user_id=user, model_id=mid)
+        if model is None:
+            raise ValueError("model not found")
+        if model.get("status") != "candidate":
+            raise ValueError(
+                f"only candidate models can be activated, current status: {model.get('status')}"
+            )
+
+        now = datetime.now(timezone.utc)
+        async with get_session() as session:
+            await session.execute(
+                text(
+                    """
+                    UPDATE qm_user_models
+                    SET status = 'ready', activated_at = :activated_at, updated_at = :updated_at
+                    WHERE tenant_id = :tenant_id AND user_id = :user_id AND model_id = :model_id
+                    """
+                ),
+                {
+                    "tenant_id": tenant,
+                    "user_id": user,
+                    "model_id": mid,
+                    "activated_at": now,
+                    "updated_at": now,
+                },
+            )
+            await session.commit()
+
+        activated = await self.get_model(tenant_id=tenant, user_id=user, model_id=mid)
+        if activated is None:
+            raise ValueError("activate result unavailable")
+        return activated
+
+    async def get_strategy_binding(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        strategy_id: str,
+    ) -> dict[str, Any] | None:
+        tenant, user = self._normalize_owner(tenant_id=tenant_id, user_id=user_id)
+        sid = str(strategy_id).strip()
+        async with get_session(read_only=True) as session:
+            row = (
+                (
+                    await session.execute(
+                        text(
+                            """
+                        SELECT b.tenant_id, b.user_id, b.strategy_id, b.model_id, b.updated_at,
+                               m.status AS model_status, m.storage_path, m.model_file
+                        FROM qm_strategy_model_bindings b
+                        LEFT JOIN qm_user_models m
+                          ON m.tenant_id = b.tenant_id AND m.user_id = b.user_id AND m.model_id = b.model_id
+                        WHERE b.tenant_id = :tenant_id AND b.user_id = :user_id AND b.strategy_id = :strategy_id
+                        LIMIT 1
+                        """
+                        ),
+                        {"tenant_id": tenant, "user_id": user, "strategy_id": sid},
+                    )
+                )
+                .mappings()
+                .first()
+            )
+        if not row:
+            return None
+        return {
+            "tenant_id": str(row.get("tenant_id") or tenant),
+            "user_id": str(row.get("user_id") or user),
+            "strategy_id": str(row.get("strategy_id") or sid),
+            "model_id": str(row.get("model_id") or ""),
+            "model_status": str(row.get("model_status") or ""),
+            "storage_path": str(row.get("storage_path") or ""),
+            "model_file": str(row.get("model_file") or ""),
+            "updated_at": row.get("updated_at").isoformat()
+            if row.get("updated_at")
+            else None,
+        }
+
+    async def set_strategy_binding(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        strategy_id: str,
+        model_id: str,
+    ) -> dict[str, Any]:
+        tenant, user = self._normalize_owner(tenant_id=tenant_id, user_id=user_id)
+        sid = str(strategy_id).strip()
+        mid = str(model_id).strip()
+        if not sid:
+            raise ValueError("strategy_id is required")
+        if not mid:
+            raise ValueError("model_id is required")
+
+        model = await self.get_model(tenant_id=tenant, user_id=user, model_id=mid)
+        if model is None:
+            raise ValueError("model not found")
+        if str(model.get("status") or "") not in _READY_STATUSES:
+            raise ValueError("model is not ready")
+
+        now = datetime.now(timezone.utc)
+        async with get_session() as session:
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO qm_strategy_model_bindings
+                    (tenant_id, user_id, strategy_id, model_id, updated_at)
+                    VALUES (:tenant_id, :user_id, :strategy_id, :model_id, :updated_at)
+                    ON CONFLICT (tenant_id, user_id, strategy_id)
+                    DO UPDATE SET model_id = EXCLUDED.model_id, updated_at = EXCLUDED.updated_at
+                    """
+                ),
+                {
+                    "tenant_id": tenant,
+                    "user_id": user,
+                    "strategy_id": sid,
+                    "model_id": mid,
+                    "updated_at": now,
+                },
+            )
+
+        binding = await self.get_strategy_binding(
+            tenant_id=tenant, user_id=user, strategy_id=sid
+        )
+        if binding is None:
+            raise ValueError("binding not found after update")
+        return binding
+
+    async def delete_strategy_binding(
+        self, *, tenant_id: str, user_id: str, strategy_id: str
+    ) -> bool:
+        tenant, user = self._normalize_owner(tenant_id=tenant_id, user_id=user_id)
+        sid = str(strategy_id).strip()
+        async with get_session() as session:
+            result = await session.execute(
+                text(
+                    """
+                    DELETE FROM qm_strategy_model_bindings
+                    WHERE tenant_id = :tenant_id AND user_id = :user_id AND strategy_id = :strategy_id
+                    """
+                ),
+                {"tenant_id": tenant, "user_id": user, "strategy_id": sid},
+            )
+            rowcount = int(getattr(result, "rowcount", 0) or 0)
+        return rowcount > 0
+
+    async def resolve_effective_model(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        strategy_id: str | None = None,
+        model_id: str | None = None,
+        market: str | None = None,
+    ) -> ResolvedModel:
+        tenant, user = self._normalize_owner(tenant_id=tenant_id, user_id=user_id)
+        await self._ensure_system_default_record(tenant_id=tenant, user_id=user)
+
+        reason_parts: list[str] = []
+        # market 约束：传入时逐层校验模型市场，不匹配跳过该层；
+        # 不传（None）= 旧行为逐字节不变（CN 兜底）
+        wanted_market = _canonical_market(market) if market else None
+
+        def _market_ok(item: dict[str, Any]) -> bool:
+            return wanted_market is None or _model_market_of(item) == wanted_market
+
+        async def _load_ready(mid: str) -> dict[str, Any] | None:
+            item = await self.get_model(tenant_id=tenant, user_id=user, model_id=mid)
+            if not item:
+                return None
+            if str(item.get("status") or "") not in _READY_STATUSES:
+                return None
+            return item
+
+        explicit_id = str(model_id or "").strip()
+        if explicit_id:
+            system_record = await self._resolve_system_model_record(explicit_id)
+            if system_record:
+                if _market_ok(system_record):
+                    return ResolvedModel(
+                        effective_model_id=str(
+                            system_record.get("model_id") or explicit_id
+                        ),
+                        model_source="explicit_system_model",
+                        fallback_used=False,
+                        fallback_reason="",
+                        storage_path=str(system_record.get("storage_path") or ""),
+                        model_file=str(system_record.get("model_file") or ""),
+                        status=str(system_record.get("status") or "active"),
+                    )
+                reason_parts.append(
+                    f"explicit system model={explicit_id} market mismatch"
+                )
+
+            explicit = await _load_ready(explicit_id)
+            if explicit:
+                if _market_ok(explicit):
+                    return ResolvedModel(
+                        effective_model_id=explicit_id,
+                        model_source="explicit_model_id",
+                        fallback_used=False,
+                        fallback_reason="",
+                        storage_path=str(explicit.get("storage_path") or ""),
+                        model_file=str(explicit.get("model_file") or ""),
+                        status=str(explicit.get("status") or "ready"),
+                    )
+                reason_parts.append(
+                    f"explicit model_id={explicit_id} market mismatch "
+                    f"(need {wanted_market})"
+                )
+            reason_parts.append(f"explicit model_id={explicit_id} not ready")
+
+        sid = str(strategy_id or "").strip()
+        if sid:
+            binding = await self.get_strategy_binding(
+                tenant_id=tenant, user_id=user, strategy_id=sid
+            )
+            if binding:
+                binding_model_id = str(binding.get("model_id") or "")
+                bound = await _load_ready(binding_model_id)
+                if bound:
+                    if _market_ok(bound):
+                        return ResolvedModel(
+                            effective_model_id=binding_model_id,
+                            model_source="strategy_binding",
+                            fallback_used=False,
+                            fallback_reason="",
+                            storage_path=str(bound.get("storage_path") or ""),
+                            model_file=str(bound.get("model_file") or ""),
+                            status=str(bound.get("status") or "ready"),
+                        )
+                    reason_parts.append(
+                        f"strategy binding model_id={binding_model_id} "
+                        f"market mismatch (need {wanted_market})"
+                    )
+                reason_parts.append(
+                    f"strategy binding model_id={binding_model_id} not ready"
+                )
+
+        default = await self.get_default_model(
+            tenant_id=tenant, user_id=user, market=wanted_market
+        )
+        if default:
+            default_id = str(default.get("model_id") or "")
+            # 走默认模型兜底 = 显式请求的模型不可用（未就绪/市场不符），**必须**
+            # 标记 fallback_used：此前这里写死 False，导致 _resolve_requested_model
+            # 的「显式请求却回落」守卫失效 —— 调用方请求模型 X、实际跑的是默认
+            # 模型 Y，且无任何报错（实测请求美股 candidate 模型时静默跑了 A 股默认模型）。
+            _explicit = str(model_id or "").strip()
+            _fell_back = bool(_explicit) and default_id != _explicit
+            return ResolvedModel(
+                effective_model_id=default_id,
+                model_source="user_default",
+                fallback_used=_fell_back,
+                fallback_reason="; ".join(reason_parts).strip() if _fell_back else "",
+                storage_path=str(default.get("storage_path") or ""),
+                model_file=str(default.get("model_file") or ""),
+                status=str(default.get("status") or "active"),
+            )
+
+        fallback_reason = "; ".join(reason_parts).strip()
+        # system 兜底模型为 CN 生产模型：显式约束非 CN 市场时不再落 CN 链
+        if (wanted_market is None or wanted_market == "CN") and self.primary_model_id and Path(self.primary_model_dir).is_dir():
+            if fallback_reason:
+                fallback_reason = f"{fallback_reason}; fallback to system model"
+            else:
+                fallback_reason = "no user model configured, fallback to system model"
+
+            return ResolvedModel(
+                effective_model_id=self.primary_model_id,
+                model_source="system_fallback",
+                fallback_used=True,
+                fallback_reason=fallback_reason,
+                storage_path=self.primary_model_dir,
+                model_file="model.lgb",
+                status="active",
+            )
+
+        return ResolvedModel(
+            effective_model_id=None,
+            model_source="none",
+            fallback_used=False,
+            fallback_reason=fallback_reason or "未配置可用模型",
+            storage_path="",
+            model_file="",
+            status="not_found",
+        )
+
+    def _resolve_system_model_record_sync(
+        self, explicit_id: str
+    ) -> dict[str, Any] | None:
+        raw = str(explicit_id or "").strip()
+        if not raw:
+            return None
+        if raw.startswith("sys-"):
+            raw = raw[4:]
+        dir_path = self.production_models_root / raw
+        if not dir_path.exists() or not dir_path.is_dir():
+            return None
+
+        meta_path = dir_path / "metadata.json"
+        metadata: dict[str, Any] = {}
+        if meta_path.is_file():
+            try:
+                metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                metadata = {}
+        display_name = ""
+        model_info = (
+            metadata.get("model_info")
+            if isinstance(metadata.get("model_info"), dict)
+            else {}
+        )
+        if isinstance(model_info, dict):
+            display_name = str(
+                model_info.get("name") or model_info.get("display_name") or ""
+            ).strip()
+        if not display_name:
+            display_name = str(metadata.get("display_name") or raw)
+
+        if raw == Path(self.primary_model_dir).name:
+            canonical_model_id = self.primary_model_id
+        elif raw == Path(self.fallback_model_dir).name:
+            canonical_model_id = self.fallback_model_id
+        else:
+            canonical_model_id = f"sys-{raw}"
+
+        context = (
+            metadata.get("context") if isinstance(metadata.get("context"), dict) else {}
+        )
+        return {
+            "model_id": canonical_model_id,
+            "dir_name": raw,
+            "tenant_id": "system",
+            "user_id": "system",
+            "status": "active",
+            "storage_path": str(dir_path),
+            "model_file": self._find_system_model_file(dir_path, metadata),
+            "display_name": display_name,
+            "metadata_json": {
+                "display_name": display_name,
+                "model_type": metadata.get("model_type")
+                or metadata.get("framework")
+                or "",
+                "feature_count": metadata.get("feature_count"),
+                "features": metadata.get("feature_columns", []),
+                "performance_metrics": metadata.get("performance_metrics", {}),
+                "context": context,
+                "train_start": metadata.get("train_start"),
+                "train_end": metadata.get("train_end"),
+                "valid_start": metadata.get("valid_start"),
+                "valid_end": metadata.get("valid_end"),
+                "test_start": metadata.get("test_start"),
+                "test_end": metadata.get("test_end"),
+            },
+            "metrics_json": metadata.get("performance_metrics", {}),
+        }
+
+    def _get_model_sync(
+        self, *, tenant_id: str, user_id: str, model_id: str
+    ) -> dict[str, Any] | None:
+        tenant, user = self._normalize_owner(tenant_id=tenant_id, user_id=user_id)
+        with get_db() as session:
+            row = (
+                session.execute(
+                    text(
+                        """
+                        SELECT tenant_id, user_id, model_id, source_run_id, status, storage_path, model_file,
+                               metadata_json, metrics_json, is_default, created_at, updated_at, activated_at
+                        FROM qm_user_models
+                        WHERE tenant_id = :tenant_id AND user_id = :user_id AND model_id = :model_id
+                        LIMIT 1
+                        """
+                    ),
+                    {"tenant_id": tenant, "user_id": user, "model_id": str(model_id)},
+                )
+                .mappings()
+                .first()
+            )
+        return self._row_to_model(dict(row)) if row else None
+
+    def _get_default_model_sync(
+        self, *, tenant_id: str, user_id: str, market: str | None = None
+    ) -> dict[str, Any] | None:
+        tenant, user = self._normalize_owner(tenant_id=tenant_id, user_id=user_id)
+        market_clause = ""
+        params: dict[str, Any] = {"tenant_id": tenant, "user_id": user}
+        if market:
+            market_clause = " AND qm_market_of(metadata_json) = :market"
+            params["market"] = _canonical_market(market)
+        with get_db() as session:
+            row = (
+                session.execute(
+                    text(
+                        f"""
+                        SELECT tenant_id, user_id, model_id, source_run_id, status, storage_path, model_file,
+                               metadata_json, metrics_json, is_default, created_at, updated_at, activated_at
+                        FROM qm_user_models
+                        WHERE tenant_id = :tenant_id AND user_id = :user_id
+                          AND is_default = TRUE AND status IN ('ready', 'active'){market_clause}
+                        ORDER BY activated_at DESC NULLS LAST, updated_at DESC
+                        LIMIT 1
+                        """
+                    ),
+                    params,
+                )
+                .mappings()
+                .first()
+            )
+        return self._row_to_model(dict(row)) if row else None
+
+    def _get_strategy_binding_sync(
+        self, *, tenant_id: str, user_id: str, strategy_id: str
+    ) -> dict[str, Any] | None:
+        tenant, user = self._normalize_owner(tenant_id=tenant_id, user_id=user_id)
+        sid = str(strategy_id or "").strip()
+        if not sid:
+            return None
+        with get_db() as session:
+            row = (
+                session.execute(
+                    text(
+                        """
+                        SELECT tenant_id, user_id, strategy_id, model_id, updated_at
+                        FROM qm_strategy_model_bindings
+                        WHERE tenant_id = :tenant_id AND user_id = :user_id AND strategy_id = :strategy_id
+                        LIMIT 1
+                        """
+                    ),
+                    {"tenant_id": tenant, "user_id": user, "strategy_id": sid},
+                )
+                .mappings()
+                .first()
+            )
+        return dict(row) if row else None
+
+    def resolve_effective_model_sync(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        strategy_id: str | None = None,
+        model_id: str | None = None,
+        market: str | None = None,
+    ) -> dict[str, Any]:
+        tenant, user = self._normalize_owner(tenant_id=tenant_id, user_id=user_id)
+
+        reason_parts: list[str] = []
+        # market 约束：传入时逐层校验模型市场，不匹配跳过该层（None = 旧行为）
+        wanted_market = _canonical_market(market) if market else None
+
+        def _market_ok(item: dict[str, Any]) -> bool:
+            return wanted_market is None or _model_market_of(item) == wanted_market
+
+        def _load_ready(mid: str) -> dict[str, Any] | None:
+            item = self._get_model_sync(tenant_id=tenant, user_id=user, model_id=mid)
+            if not item:
+                return None
+            if str(item.get("status") or "") not in _READY_STATUSES:
+                return None
+            return item
+
+        explicit_id = str(model_id or "").strip()
+        if explicit_id:
+            system_record = self._resolve_system_model_record_sync(explicit_id)
+            if system_record:
+                if _market_ok(system_record):
+                    return ResolvedModel(
+                        effective_model_id=str(
+                            system_record.get("model_id") or explicit_id
+                        ),
+                        model_source="explicit_system_model",
+                        fallback_used=False,
+                        fallback_reason="",
+                        storage_path=str(system_record.get("storage_path") or ""),
+                        model_file=str(system_record.get("model_file") or ""),
+                        status=str(system_record.get("status") or "active"),
+                    ).to_dict()
+                reason_parts.append(
+                    f"explicit system model={explicit_id} market mismatch"
+                )
+
+            explicit = _load_ready(explicit_id)
+            if explicit:
+                if _market_ok(explicit):
+                    return ResolvedModel(
+                        effective_model_id=explicit_id,
+                        model_source="explicit_model_id",
+                        fallback_used=False,
+                        fallback_reason="",
+                        storage_path=str(explicit.get("storage_path") or ""),
+                        model_file=str(explicit.get("model_file") or ""),
+                        status=str(explicit.get("status") or "ready"),
+                    ).to_dict()
+                reason_parts.append(
+                    f"explicit model_id={explicit_id} market mismatch "
+                    f"(need {wanted_market})"
+                )
+            reason_parts.append(f"explicit model_id={explicit_id} not ready")
+
+        sid = str(strategy_id or "").strip()
+        if sid:
+            binding = self._get_strategy_binding_sync(
+                tenant_id=tenant, user_id=user, strategy_id=sid
+            )
+            if binding:
+                binding_model_id = str(binding.get("model_id") or "")
+                bound = _load_ready(binding_model_id)
+                if bound:
+                    if _market_ok(bound):
+                        return ResolvedModel(
+                            effective_model_id=binding_model_id,
+                            model_source="strategy_binding",
+                            fallback_used=False,
+                            fallback_reason="",
+                            storage_path=str(bound.get("storage_path") or ""),
+                            model_file=str(bound.get("model_file") or ""),
+                            status=str(bound.get("status") or "ready"),
+                        ).to_dict()
+                    reason_parts.append(
+                        f"strategy binding model_id={binding_model_id} "
+                        f"market mismatch (need {wanted_market})"
+                    )
+                reason_parts.append(
+                    f"strategy binding model_id={binding_model_id} not ready"
+                )
+
+        default = self._get_default_model_sync(
+            tenant_id=tenant, user_id=user, market=wanted_market
+        )
+        if default:
+            default_id = str(default.get("model_id") or "")
+            return ResolvedModel(
+                effective_model_id=default_id,
+                model_source="user_default",
+                fallback_used=False,
+                fallback_reason="",
+                storage_path=str(default.get("storage_path") or ""),
+                model_file=str(default.get("model_file") or ""),
+                status=str(default.get("status") or "active"),
+            ).to_dict()
+
+        fallback_reason = "; ".join(reason_parts).strip()
+        # system 兜底模型为 CN 生产模型：显式约束非 CN 市场时不再落 CN 链
+        if (wanted_market is None or wanted_market == "CN") and self.primary_model_id and Path(self.primary_model_dir).is_dir():
+            if fallback_reason:
+                fallback_reason = f"{fallback_reason}; fallback to system model"
+            else:
+                fallback_reason = "no user model configured, fallback to system model"
+
+            return ResolvedModel(
+                effective_model_id=self.primary_model_id,
+                model_source="system_fallback",
+                fallback_used=True,
+                fallback_reason=fallback_reason,
+                storage_path=self.primary_model_dir,
+                model_file="model.lgb",
+                status="active",
+            ).to_dict()
+
+        return ResolvedModel(
+            effective_model_id=None,
+            model_source="none",
+            fallback_used=False,
+            fallback_reason=fallback_reason or "未配置可用模型",
+            storage_path="",
+            model_file="",
+            status="not_found",
+        ).to_dict()
+
+    @staticmethod
+    def build_model_id_from_run(run_id: str, market: str = "CN") -> str:
+        raw = str(run_id or "").strip()
+        if not raw:
+            raw = datetime.now().strftime("%Y%m%d%H%M%S")
+        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+        normalized = "".join(c if c.isalnum() or c in {"_", "-"} else "_" for c in raw)
+        normalized = normalized[:88].strip("_") or "train_run"
+        market_prefix = str(market or "CN").upper().strip()[:4] or "CN"
+        return f"mdl_{market_prefix.lower()}_{normalized}_{digest}"
+
+    @staticmethod
+    def _infer_market_from_benchmark(benchmark: Any) -> str:
+        """从 benchmark 推断市场，与 admin_training_utils._resolve_market 保持一致。"""
+        raw = str(benchmark or "").upper().strip()
+        _BENCHMARK_MARKET = {
+            "HSI": "HK",
+            "HSCEI": "HK",
+            "HSTECH": "HK",
+            "SPX": "US",
+            "NDX": "US",
+            "DJI": "US",
+            "IXIC": "US",
+            "BTC": "CRYPTO",
+            "ETH": "CRYPTO",
+            "CL": "FUTURES",
+            "RB": "FUTURES",
+            "AU": "FUTURES",
+            "CU": "FUTURES",
+        }
+        return _BENCHMARK_MARKET.get(raw, "CN")
+
+    async def register_model_from_training_run(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        run_id: str,
+        request_payload: dict[str, Any],
+        result_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        tenant, user = self._normalize_owner(tenant_id=tenant_id, user_id=user_id)
+        await self.ensure_tables()
+
+        # 先解析目标市场（显式 context.market 或 benchmark 推断），
+        # 用于 model_id 前缀与存储路径市场分段
+        req_context = (
+            request_payload.get("context")
+            if isinstance(request_payload.get("context"), dict)
+            else {}
+        )
+        market_str = str(req_context.get("market") or "").upper().strip()
+        if not market_str:
+            market_str = self._infer_market_from_benchmark(req_context.get("benchmark"))
+        market_str = market_str or "CN"
+
+        model_id = self.build_model_id_from_run(run_id, market=market_str)
+        now = datetime.now(timezone.utc)
+        # 非 CN 市场模型按市场子目录分段，避免与 A 股模型混放
+        model_dir = self.user_models_root / tenant / user / model_id
+        if market_str and market_str != "CN":
+            model_dir = (
+                self.user_models_root / tenant / user / market_str.lower() / model_id
+            )
+        model_dir.mkdir(parents=True, exist_ok=True)
+
+        metrics = (
+            result_payload.get("metrics")
+            if isinstance(result_payload.get("metrics"), dict)
+            else {}
+        )
+        metadata = (
+            result_payload.get("metadata")
+            if isinstance(result_payload.get("metadata"), dict)
+            else {}
+        )
+
+        # Propagate context (market, benchmark, etc.) from request to metadata
+        existing_context = (
+            metadata.get("context") if isinstance(metadata.get("context"), dict) else {}
+        )
+        merged_context = {**existing_context, **req_context}
+        if (
+            "market" not in merged_context
+            or not str(merged_context.get("market") or "").strip()
+        ):
+            merged_context["market"] = market_str
+
+        # Resolve display_name, appending market suffix if missing
+        raw_display_name = str(
+            request_payload.get("display_name")
+            or metadata.get("display_name")
+            or request_payload.get("job_name")
+            or run_id
+        )
+        if market_str and not raw_display_name.upper().endswith(f"_{market_str}"):
+            raw_display_name = f"{raw_display_name}_{market_str}"
+
+        metadata = {
+            **metadata,
+            "context": merged_context,
+            "market": market_str or "CN",
+            "display_name": raw_display_name,
+            "model_name": str(
+                request_payload.get("display_name")
+                or metadata.get("model_name")
+                or request_payload.get("job_name")
+                or run_id
+            ),
+            "target_horizon_days": request_payload.get("target_horizon_days"),
+            "target_mode": request_payload.get("target_mode"),
+            "label_formula": request_payload.get("label_formula"),
+            "training_window": request_payload.get("training_window"),
+        }
+
+        async with get_session() as session:
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO qm_user_models (
+                        tenant_id, user_id, model_id, source_run_id, status, storage_path, model_file,
+                        metadata_json, metrics_json, is_default, created_at, updated_at, activated_at
+                    ) VALUES (
+                        :tenant_id, :user_id, :model_id, :source_run_id, 'candidate', :storage_path, '',
+                        CAST(:metadata_json AS JSONB), CAST(:metrics_json AS JSONB), FALSE,
+                        :created_at, :updated_at, NULL
+                    )
+                    ON CONFLICT (tenant_id, user_id, model_id)
+                    DO UPDATE SET
+                        source_run_id = EXCLUDED.source_run_id,
+                        status = 'candidate',
+                        storage_path = EXCLUDED.storage_path,
+                        metadata_json = EXCLUDED.metadata_json,
+                        metrics_json = EXCLUDED.metrics_json,
+                        updated_at = EXCLUDED.updated_at
+                    """
+                ),
+                {
+                    "tenant_id": tenant,
+                    "user_id": user,
+                    "model_id": model_id,
+                    "source_run_id": str(run_id),
+                    "storage_path": str(model_dir.resolve()),
+                    "metadata_json": json.dumps(metadata, ensure_ascii=False),
+                    "metrics_json": json.dumps(metrics, ensure_ascii=False),
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
+
+            await session.execute(
+                text(
+                    """
+                    UPDATE qm_user_models
+                    SET status = 'syncing', updated_at = :updated_at
+                    WHERE tenant_id = :tenant_id AND user_id = :user_id AND model_id = :model_id
+                    """
+                ),
+                {
+                    "tenant_id": tenant,
+                    "user_id": user,
+                    "model_id": model_id,
+                    "updated_at": now,
+                },
+            )
+
+        sync_status, sync_error, model_file = self._sync_candidate_artifacts(
+            run_id=run_id,
+            tenant_id=tenant,
+            user_id=user,
+            model_id=model_id,
+            target_dir=model_dir,
+        )
+
+        validation_error = self._validate_synced_model(
+            target_dir=model_dir,
+            model_file=model_file,
+            request_payload=request_payload,
+        )
+        if validation_error and not sync_error:
+            sync_error = validation_error
+            sync_status = "failed"
+
+        # 样本外验证软门禁：自动进入默认池前必须有可解释的 test Rank IC
+        # 与 ICIR。门禁只阻止自动默认，用户仍可在模型页人工激活候选模型。
+        gate_triggered = False
+        _test_icir = self._extract_test_rank_icir(metadata, metrics)
+        _test_rank_ic = self._extract_test_rank_ic(metadata, metrics)
+        _gate_threshold = 0.05
+        gate_reasons: list[str] = []
+        if _test_icir is None:
+            gate_reasons.append("缺少 test_rank_icir")
+        elif _test_icir < _gate_threshold:
+            gate_reasons.append(
+                f"test_rank_icir={_test_icir:.4f} 低于软门禁阈值 {_gate_threshold}"
+            )
+        if _test_rank_ic is None:
+            gate_reasons.append("缺少 test_rank_ic")
+        elif _test_rank_ic <= 0:
+            gate_reasons.append(f"test_rank_ic={_test_rank_ic:.4f} 非正")
+
+        if sync_status == "ready" and gate_reasons:
+            logger.warning(
+                "Model %s held at candidate by out-of-sample quality gate: %s",
+                model_id,
+                "; ".join(gate_reasons),
+            )
+            sync_status = "candidate"
+            gate_triggered = True
+            metadata.setdefault("quality_warnings", []).append(
+                f"样本外质量门禁：{'；'.join(gate_reasons)}，"
+                "未自动激活。请人工评估后在模型管理页手动激活。"
+            )
+
+        async with get_session() as session:
+            if sync_status == "ready":
+                has_business_default = (
+                    await session.execute(
+                        text(
+                            """
+                            SELECT 1
+                            FROM qm_user_models
+                            WHERE tenant_id = :tenant_id AND user_id = :user_id
+                              AND is_default = TRUE
+                              AND COALESCE((metadata_json->>'system_default')::boolean, FALSE) = FALSE
+                            LIMIT 1
+                            """
+                        ),
+                        {"tenant_id": tenant, "user_id": user},
+                    )
+                ).first()
+                should_set_default = not bool(has_business_default)
+                if should_set_default:
+                    await session.execute(
+                        text(
+                            """
+                            UPDATE qm_user_models
+                            SET is_default = FALSE, updated_at = :updated_at
+                            WHERE tenant_id = :tenant_id AND user_id = :user_id AND is_default = TRUE
+                            """
+                        ),
+                        {"tenant_id": tenant, "user_id": user, "updated_at": now},
+                    )
+
+                await session.execute(
+                    text(
+                        """
+                        UPDATE qm_user_models
+                        SET status = 'ready',
+                            model_file = :model_file,
+                            is_default = :is_default,
+                            activated_at = CASE WHEN :is_default THEN :activated_at ELSE activated_at END,
+                            updated_at = :updated_at
+                        WHERE tenant_id = :tenant_id AND user_id = :user_id AND model_id = :model_id
+                        """
+                    ),
+                    {
+                        "tenant_id": tenant,
+                        "user_id": user,
+                        "model_id": model_id,
+                        "model_file": model_file,
+                        "is_default": bool(should_set_default),
+                        "activated_at": now,
+                        "updated_at": now,
+                    },
+                )
+            elif gate_triggered:
+                # 软门禁触发：保持 candidate，持久化 quality_warnings
+                await session.execute(
+                    text(
+                        """
+                        UPDATE qm_user_models
+                        SET status = 'candidate',
+                            model_file = :model_file,
+                            metadata_json = :metadata_json,
+                            updated_at = :updated_at
+                        WHERE tenant_id = :tenant_id AND user_id = :user_id AND model_id = :model_id
+                        """
+                    ),
+                    {
+                        "tenant_id": tenant,
+                        "user_id": user,
+                        "model_id": model_id,
+                        "model_file": model_file,
+                        "metadata_json": json.dumps(metadata, ensure_ascii=False),
+                        "updated_at": now,
+                    },
+                )
+            else:
+                await session.execute(
+                    text(
+                        """
+                        UPDATE qm_user_models
+                        SET status = 'failed', model_file = :model_file, updated_at = :updated_at
+                        WHERE tenant_id = :tenant_id AND user_id = :user_id AND model_id = :model_id
+                        """
+                    ),
+                    {
+                        "tenant_id": tenant,
+                        "user_id": user,
+                        "model_id": model_id,
+                        "model_file": model_file,
+                        "updated_at": now,
+                    },
+                )
+
+        return {
+            "model_id": model_id,
+            "status": sync_status,
+            "error": sync_error or "",
+            "storage_path": str(model_dir.resolve()),
+            "model_file": model_file,
+            # 软门禁暂留时非空：完成回调据此如实提示（训练成功、待手动激活），
+            # 而不是误报“模型注册失败”。
+            "gate_reasons": gate_reasons,
+            "message": (
+                f"样本外质量门禁：{'；'.join(gate_reasons)}，未自动激活。"
+                "请人工评估后在模型管理页手动激活。"
+                if gate_triggered
+                else ""
+            ),
+        }
+
+    @staticmethod
+    def _child_model_id(base_model_id: str, model_type: str) -> str:
+        """多算法拆分子条目的 model_id（确定性 hash，保证重复执行幂等）。"""
+        digest = hashlib.sha1(
+            f"{base_model_id}:{model_type}".encode("utf-8")
+        ).hexdigest()[:8]
+        safe = "".join(c if c.isalnum() or c in {"_", "-"} else "_" for c in model_type)
+        return f"{base_model_id}_{safe}_{digest}"
+
+    @staticmethod
+    def _file_md5(path: Path) -> str | None:
+        """文件 md5（用于识别「原样复制的父份产物」）；不可读返回 None。"""
+        try:
+            if not path.is_file():
+                return None
+            digest = hashlib.md5()
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _find_per_algorithm_pred(
+        parent_dir: Path, job_dir: Path | None, model_type: str
+    ) -> Path | None:
+        """定位某算法的专属预测文件 pred_{type}.parquet。
+
+        训练端在任务工作目录写出每个基模型的独立预测；同步产物可能已复制进
+        模型目录。两处都找不到则返回 None（不伪造，由调用方如实标记）。
+        """
+        name = f"pred_{model_type}.parquet"
+        candidates = [parent_dir / name]
+        if job_dir is not None:
+            candidates.append(job_dir / name)
+        for cand in candidates:
+            if cand.is_file():
+                return cand
+        return None
+
+    @staticmethod
+    def _pred_coverage_fields(pred_parquet: Path) -> dict[str, Any]:
+        """从 pred.parquet 的 trade_date 列读出覆盖度（读不出则为 None）。"""
+        fields: dict[str, Any] = {
+            "pred_rows": None,
+            "pred_coverage_start": None,
+            "pred_coverage_end": None,
+        }
+        try:
+            import pandas as pd
+
+            dates = pd.to_datetime(
+                pd.read_parquet(pred_parquet, columns=["trade_date"])["trade_date"]
+            )
+            fields["pred_rows"] = int(len(dates))
+            if len(dates):
+                fields["pred_coverage_start"] = str(dates.min().date())
+                fields["pred_coverage_end"] = str(dates.max().date())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取 %s 覆盖度失败: %s", pred_parquet, exc)
+        return fields
+
+    def _adopt_parent_predictions(
+        self, *, child_dir: Path, parent_dir: Path
+    ) -> dict[str, Any]:
+        """主算法子模型沿用父份预测（父份就是这个算法自己的预测）。"""
+        for name in ("pred.parquet", "pred.pkl"):
+            src = parent_dir / name
+            if not src.is_file():
+                continue
+            dest = child_dir / name
+            if src.resolve() != dest.resolve():
+                shutil.copy2(src, dest)
+        return {
+            "pred_source": "parent_primary",
+            **self._pred_coverage_fields(child_dir / "pred.parquet"),
+        }
+
+    def _materialize_child_predictions(
+        self,
+        *,
+        child_dir: Path,
+        model_type: str,
+        per_algo_pred: Path | None,
+        parent_dir: Path,
+        is_primary: bool,
+        is_ensemble: bool,
+        parent_pred_md5s: dict[str, str | None],
+    ) -> dict[str, Any]:
+        """写入子模型自己的 pred.parquet / pred.pkl，返回其覆盖度元数据。
+
+        训练期存有 per-algorithm 预测（pred_{type}.parquet）时直接采用；
+        没有时：主算法且非集成训练 → 父份本来就是它的预测，沿用；其余算法
+        **不复制父份**（复制会让多模型曲线画出多条相同曲线），并清理历史上
+        被原样复制进来的父份文件（按 md5 精确识别）。
+        """
+        unavailable: dict[str, Any] = {
+            "pred_source": "unavailable",
+            # 覆盖度字段是主模型的预测口径，不能用它冒充子模型自己的覆盖度
+            "pred_rows": None,
+            "pred_coverage_start": None,
+            "pred_coverage_end": None,
+        }
+        if per_algo_pred is None:
+            if is_primary and not is_ensemble:
+                parent_parquet = parent_dir / "pred.parquet"
+                if parent_parquet.is_file():
+                    return self._adopt_parent_predictions(
+                        child_dir=child_dir, parent_dir=parent_dir
+                    )
+            for name in ("pred.parquet", "pred.pkl"):
+                stale = child_dir / name
+                expected = parent_pred_md5s.get(name)
+                if expected and self._file_md5(stale) == expected:
+                    try:
+                        stale.unlink()
+                    except OSError as exc:
+                        logger.warning("清理残留父份预测失败 %s: %s", stale, exc)
+            logger.warning(
+                "拆分子模型 %s/%s：无 per-algorithm 预测文件，未写入 pred 产物",
+                child_dir.name,
+                model_type,
+            )
+            return unavailable
+
+        copied_parquet = False
+        try:
+            import pandas as pd
+
+            # 只读需要的三列；列缺失会在此抛错，此时尚未落盘，不留半成品
+            frame = pd.read_parquet(
+                per_algo_pred, columns=["trade_date", "symbol", "pred"]
+            )
+            dest_parquet = child_dir / "pred.parquet"
+            if per_algo_pred.resolve() != dest_parquet.resolve():
+                shutil.copy2(per_algo_pred, dest_parquet)
+                copied_parquet = True
+            pred_qlib = (
+                frame[["trade_date", "symbol", "pred"]]
+                .rename(
+                    columns={
+                        "trade_date": "datetime",
+                        "symbol": "instrument",
+                        "pred": "score",
+                    }
+                )
+                .assign(datetime=lambda d: pd.to_datetime(d["datetime"]))
+                .set_index(["datetime", "instrument"])
+                .sort_index()
+            )
+            pred_qlib.to_pickle(child_dir / "pred.pkl")
+            trade_dates = pd.to_datetime(frame["trade_date"])
+            fields: dict[str, Any] = {
+                "pred_source": per_algo_pred.name,
+                "pred_rows": int(len(frame)),
+                "pred_coverage_start": None,
+                "pred_coverage_end": None,
+            }
+            if len(frame):
+                fields["pred_coverage_start"] = str(trade_dates.min().date())
+                fields["pred_coverage_end"] = str(trade_dates.max().date())
+            return fields
+        except Exception as exc:  # noqa: BLE001
+            if copied_parquet:
+                # 本次刚复制进来但 pred.pkl 生成失败：删掉半成品保持一致
+                try:
+                    (child_dir / "pred.parquet").unlink()
+                except OSError:
+                    pass
+            logger.warning(
+                "拆分子模型 %s/%s：per-algorithm 预测写入失败: %s",
+                child_dir.name,
+                model_type,
+                exc,
+            )
+            return unavailable
+
+    def _build_child_model_metadata(
+        self,
+        *,
+        parent_meta: dict[str, Any],
+        record: dict[str, Any],
+        model_type: str,
+        model_file: str,
+        child_id: str,
+        child_dir: Path,
+        parent_dir: Path,
+        job_dir: Path | None,
+        comparison: dict[str, dict[str, Any]],
+        primary_type: str,
+        parent_pred_md5s: dict[str, str | None],
+    ) -> dict[str, Any]:
+        """按算法重建子模型 metadata（架构 / 指标 / 预测覆盖度）。"""
+        mtype = model_type.strip().lower()
+        algo_fields, algo_drops = build_algorithm_metadata(mtype, parent_meta)
+        child_meta = dict(parent_meta)
+        for key in algo_drops:
+            child_meta.pop(key, None)
+        child_meta.update(algo_fields)
+
+        # 主模型私有字段清理：下面按算法重算
+        child_meta["model_id"] = child_id
+        child_meta["source_run_id"] = (
+            f"{record.get('source_run_id') or ''}_{model_type}"
+        )
+        child_meta["is_multi_model"] = False
+        child_meta["model_types"] = [model_type]
+        child_meta["model_type"] = model_type
+        child_meta["primary_model_type"] = model_type
+        child_meta["model_file"] = model_file
+        child_meta["saved_models"] = {model_type: model_file}
+
+        # 集成（stacking）训练的子条目是单个基模型：父份的集成标记必须摘掉，
+        # 否则推理端按 is_ensemble 选融合模板，而融合产物（meta_model.pkl /
+        # base_model_files）并不随子模型复制。
+        is_ensemble = bool(
+            parent_meta.get("is_ensemble")
+            or str(parent_meta.get("model_type") or "").strip().lower() == "stacking"
+            or str(parent_meta.get("ensemble_method") or "").strip().lower()
+            not in ("", "none")
+        )
+        if is_ensemble:
+            for key in (
+                "is_ensemble",
+                "ensemble_method",
+                "base_model_files",
+                "meta_model_file",
+                "base_model_fill_values",
+                "meta_learner",
+                "fold_method",
+                "n_folds",
+                "oof_predictions",
+            ):
+                child_meta.pop(key, None)
+            child_meta["is_ensemble"] = False
+
+        metrics = build_algorithm_metrics(mtype, parent_meta, comparison)
+        if metrics is not None:
+            child_meta["metrics"] = metrics
+        elif mtype != primary_type:
+            # 取不到该算法指标时宁可缺省，也不回填主模型指标
+            child_meta.pop("metrics", None)
+
+        entry = comparison.get(mtype)
+        if isinstance(entry, dict):
+            elapsed = entry.get("elapsed_seconds")
+            if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool):
+                child_meta["elapsed_seconds"] = elapsed
+
+        if mtype == "xgboost":
+            child_meta["best_iteration"] = read_xgboost_best_iteration(
+                child_dir / model_file
+            )
+
+        # SHAP 仅 LightGBM 基模型有产出：归属 lgb 子模型，其余显式禁用
+        if mtype == "lightgbm" and (parent_dir / "shap_summary.csv").is_file():
+            shutil.copy2(
+                parent_dir / "shap_summary.csv", child_dir / "shap_summary.csv"
+            )
+        else:
+            child_meta["shap"] = {
+                "enabled": False,
+                "status": "disabled",
+                "reason": f"SHAP 仅对 LightGBM 基模型计算（当前算法 {model_type}）",
+            }
+
+        child_meta.update(
+            self._materialize_child_predictions(
+                child_dir=child_dir,
+                model_type=mtype,
+                per_algo_pred=self._find_per_algorithm_pred(parent_dir, job_dir, mtype),
+                parent_dir=parent_dir,
+                is_primary=mtype == primary_type,
+                is_ensemble=is_ensemble,
+                parent_pred_md5s=parent_pred_md5s,
+            )
+        )
+        return child_meta
+
+    async def split_multi_model_entries(
+        self, *, tenant_id: str, user_id: str, model_id: str
+    ) -> list[dict[str, Any]]:
+        """把一次多算法训练的产出拆成「一个算法一条」的独立模型记录。
+
+        模型库的设计是**一条记录 = 一个算法**：A 股历史记录各自 `model_type`
+        单一，港股那 13 条也是从同一次训练拆出的单模型包。而注册流程只写 1 条，
+        其余算法的权重虽在目录里却无法被选中 —— 用户训练 13 个模型却只看到 1 个。
+
+        本方法按 metadata.saved_models 为每个算法生成独立目录（该算法的权重 +
+        推理脚本 + **该算法自己的预测/结果**）与独立 DB 记录；metadata 重写为
+        单算法形态（架构参数、指标、score_direction 都按算法各自重建）。
+        确定性 model_id + ON CONFLICT 保证重复调用幂等。
+
+        预测量来源：训练任务工作目录的 `pred_{model_type}.parquet`（训练端为每个
+        基模型独立写出）；只有主算法（非集成训练）能沿用父份——父份本就是它的
+        预测；其余算法找不到自己的预测时如实标记 pred_source=unavailable，
+        不复制父份冒充。
+
+        返回新建/更新的条目列表；单算法模型返回空列表。
+        """
+        tenant, user = self._normalize_owner(tenant_id=tenant_id, user_id=user_id)
+        record = await self.get_model(tenant_id=tenant, user_id=user, model_id=model_id)
+        if not record:
+            return []
+        base_dir = Path(str(record.get("storage_path") or ""))
+        meta_path = base_dir / "metadata.json"
+        if not meta_path.is_file():
+            return []
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            logger.warning("拆分子模型：metadata.json 解析失败 %s", meta_path)
+            return []
+        saved = meta.get("saved_models") or {}
+        if not isinstance(saved, dict) or len(saved) <= 1:
+            return []  # 单算法训练，无需拆分
+
+        from backend.shared.training_runtime import training_jobs_dir
+
+        run_id = str(meta.get("run_id") or "").strip()
+        job_dir = training_jobs_dir(run_id) if run_id else None
+        comparison = comparison_index(meta)
+        primary_type = (
+            str(meta.get("primary_model_type") or meta.get("model_type") or "")
+            .strip()
+            .lower()
+        )
+        parent_pred_md5s = {
+            name: self._file_md5(base_dir / name)
+            for name in ("pred.parquet", "pred.pkl")
+        }
+
+        # 随每条子模型一起复制的共享产物（推理脚本 / 训练配置 / 运行结果，缺则跳过）
+        _shared = ("inference.py", "config.yaml", "result.json")
+        created: list[dict[str, Any]] = []
+        now = datetime.now(timezone.utc)
+        for mtype, filename in saved.items():
+            mtype_key = str(mtype)
+            fname = str(filename or "").strip()
+            # saved_models 的值来自 metadata：拒绝带路径分隔符的名字，
+            # 避免越出模型目录复制/写入
+            if not fname or Path(fname).name != fname:
+                logger.warning("拆分子模型：权重文件名非法，跳过 %s/%s", model_id, fname)
+                continue
+            if not (base_dir / fname).is_file():
+                logger.warning("拆分子模型：权重缺失，跳过 %s/%s", model_id, fname)
+                continue
+            child_id = self._child_model_id(model_id, mtype_key)
+            child_dir = base_dir.parent / child_id
+            try:
+                child_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(base_dir / fname, child_dir / fname)
+                for shared in _shared:
+                    src = base_dir / shared
+                    if src.is_file():
+                        dest = child_dir / shared
+                        if src.resolve() != dest.resolve():
+                            shutil.copy2(src, dest)
+                child_meta = self._build_child_model_metadata(
+                    parent_meta=meta,
+                    record=record,
+                    model_type=mtype_key,
+                    model_file=fname,
+                    child_id=child_id,
+                    child_dir=child_dir,
+                    parent_dir=base_dir,
+                    job_dir=job_dir,
+                    comparison=comparison,
+                    primary_type=primary_type,
+                    parent_pred_md5s=parent_pred_md5s,
+                )
+                (child_dir / "metadata.json").write_text(
+                    json.dumps(child_meta, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("拆分子模型失败 %s (%s): %s", model_id, mtype, exc)
+                continue
+
+            child_metrics_json = build_child_metrics_json(
+                comparison.get(mtype_key.lower())
+            )
+            async with get_session() as session:
+                await session.execute(
+                    text(
+                        """
+                        INSERT INTO qm_user_models (
+                            tenant_id, user_id, model_id, source_run_id, status, storage_path,
+                            model_file, metadata_json, metrics_json, is_default,
+                            created_at, updated_at, activated_at
+                        ) VALUES (
+                            :tenant_id, :user_id, :model_id, :source_run_id, :status, :storage_path,
+                            :model_file, CAST(:metadata_json AS JSONB), CAST(:metrics_json AS JSONB),
+                            FALSE, :created_at, :updated_at, NULL
+                        )
+                        ON CONFLICT (tenant_id, user_id, model_id)
+                        DO UPDATE SET
+                            status = EXCLUDED.status,
+                            storage_path = EXCLUDED.storage_path,
+                            model_file = EXCLUDED.model_file,
+                            metadata_json = EXCLUDED.metadata_json,
+                            metrics_json = EXCLUDED.metrics_json,
+                            updated_at = EXCLUDED.updated_at
+                        """
+                    ),
+                    {
+                        "tenant_id": tenant,
+                        "user_id": user,
+                        "model_id": child_id,
+                        "source_run_id": str(record.get("source_run_id") or ""),
+                        "status": str(record.get("status") or "candidate"),
+                        "storage_path": str(child_dir.resolve()),
+                        "model_file": fname,
+                        "metadata_json": json.dumps(child_meta, ensure_ascii=False),
+                        "metrics_json": json.dumps(
+                            child_metrics_json, ensure_ascii=False
+                        ),
+                        "created_at": now,
+                        "updated_at": now,
+                    },
+                )
+            created.append(
+                {"model_id": child_id, "model_type": mtype, "model_file": fname}
+            )
+        if created:
+            logger.info(
+                "多算法模型 %s 拆分为 %d 条单模型记录: %s",
+                model_id,
+                len(created),
+                [c["model_type"] for c in created],
+            )
+        return created
+
+    async def register_ensemble_model(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        source_model_ids: list[str],
+        display_name: str,
+        weight_strategy: str = "equal",
+        manual_weights: dict[str, float] | None = None,
+        fusion_strategy: str = "linear",
+        strategy_config: dict[str, float] | None = None,
+        weights_override: dict[str, float] | None = None,
+        weight_diagnostics: list[dict[str, Any]] | None = None,
+        fusion_eval: dict[str, Any] | None = None,
+        target_horizon_days: int | None = None,
+    ) -> dict[str, Any]:
+        """创建持久化融合模型（推理时融合多个源模型的预测）。
+
+        源模型可以是任意类型（单模型 / stacking 融合 / 不同周期）。
+        融合模型不包含二进制权重，其目录含：
+          - ensemble_config.json  源模型引用 + 权重 + 策略（v2）
+          - weight_snapshot.json  v2 权重快照（模板动态权重读取）
+          - weight_history.jsonl  权重审计流水（每次刷新/重建一行）
+          - fusion_eval.json      OOS 回放结论（可选）
+          - metadata.json         融合元信息
+          - inference.py          融合推理脚本（复用 inference_ensemble_src 模板）
+
+        权重策略：
+          - icir_shrunk  机构级（orchestrator 传入 weights_override，见
+                         backend/services/engine/inference/fusion_orchestrator.py）
+          - equal        每个源模型等权
+          - icir         按源模型 Val Rank ICIR 归一化加权（创建时静态）
+          - manual       使用 manual_weights（自动归一化到和为 1）
+
+        创建即写 qm_model_inference_settings(enabled=TRUE) —— 融合模型进入日更
+        推理名单（历史「融合模型没有预测能力」根因 = 该行为缺失）。写入失败不
+        阻断创建，但通过返回值 daily_inference.error 显式暴露。
+        """
+        tenant, user = self._normalize_owner(tenant_id=tenant_id, user_id=user_id)
+        await self.ensure_tables()
+
+        source_model_ids = [
+            str(m).strip() for m in (source_model_ids or []) if str(m).strip()
+        ]
+        if len(source_model_ids) < 2:
+            raise ValueError("融合至少需要 2 个源模型")
+
+        # 加载全部源模型（含 metadata_json + metrics_json）
+        sources: list[dict[str, Any]] = []
+        for mid in source_model_ids:
+            model = await self.get_model(tenant_id=tenant, user_id=user, model_id=mid)
+            if not model:
+                raise ValueError(f"源模型不存在: {mid}")
+            if str(model.get("status")) not in _READY_STATUSES:
+                raise ValueError(
+                    f"源模型 {mid} 状态为 {model.get('status')}，需为 ready/active"
+                )
+            sources.append(model)
+
+        # 权重计算
+        if weights_override is not None:
+            # 机构级引擎（fusion_orchestrator）已算好最终权重：这里只做防御性校验
+            # 与重归一，不再走任何静态策略（创建时 val_icir 之类已废弃）。
+            cleaned_w: dict[str, float] = {}
+            for mid in source_model_ids:
+                v = weights_override.get(mid)
+                try:
+                    fv = float(v)  # type: ignore[arg-type]
+                except (TypeError, ValueError):
+                    raise ValueError(f"融合权重缺失或非法: {mid}={v!r}") from None
+                if not math.isfinite(fv) or fv < 0:
+                    raise ValueError(f"融合权重非法: {mid}={v!r}")
+                cleaned_w[mid] = fv
+            total_w = sum(cleaned_w.values())
+            if total_w <= 0:
+                raise ValueError("融合权重全为 0")
+            weights = {k: v / total_w for k, v in cleaned_w.items()}
+        elif weight_strategy == "icir":
+            weights: dict[str, float] = {}
+            for src in sources:
+                mid = str(src["model_id"])
+                meta = self._parse_json_field(src.get("metadata_json"))
+                metrics = self._parse_json_field(src.get("metrics_json"))
+                icir = None
+                # metrics_json 只有 train/val/test 三段时取不到扁平 ICIR 键，
+                # 逐个试探：跳过缺失/None/非数值/NaN-inf，只取首个有限值。
+                # 此前 `if k in metrics: float(...)` 在值为 None 时直接抛 TypeError。
+                search_spaces: list[dict[str, Any]] = []
+                if isinstance(metrics, dict):
+                    search_spaces.append(metrics)
+                m = meta.get("metrics")
+                if isinstance(m, dict):
+                    search_spaces.append(m)
+                for space in search_spaces:
+                    if icir is not None:
+                        break
+                    for k in ("val_rank_icir", "val_icir", "rank_icir"):
+                        v = space.get(k)
+                        if v is None:
+                            continue
+                        try:
+                            fv = float(v)
+                        except (TypeError, ValueError):
+                            continue
+                        if math.isfinite(fv):
+                            icir = fv
+                            break
+                # 负 ICIR 截断为 0（该周期不参与融合）；全员非正时走下方等权兜底。
+                weights[mid] = max(float(icir or 0.0), 0.0)
+                logger.info(
+                    "ensemble icir candidate %s: val_rank_icir=%s -> raw_weight=%.6f",
+                    mid,
+                    icir,
+                    weights[mid],
+                )
+            total = sum(weights.values())
+            if total <= 0:
+                # 此前 `total = sum(...) or 1.0` 把 0 转成 1.0，导致该分支永不可达，
+                # 全零/全负 ICIR 时会产出和为 0 的全零权重。先判零再归一化。
+                logger.warning(
+                    "ensemble icir weights all non-positive; falling back to equal weights"
+                )
+                weights = {str(s["model_id"]): 1.0 / len(sources) for s in sources}
+            else:
+                weights = {k: v / total for k, v in weights.items()}
+        elif weight_strategy == "manual":
+            manual_weights = manual_weights or {}
+            raw = {str(k): float(v) for k, v in manual_weights.items() if float(v) > 0}
+            missing = [
+                str(s["model_id"]) for s in sources if str(s["model_id"]) not in raw
+            ]
+            if missing:
+                raise ValueError(f"manual 权重缺少源模型: {missing}")
+            total = sum(raw.values()) or 1.0
+            weights = {k: v / total for k, v in raw.items()}
+        elif weight_strategy == "recent_ic":
+            # 初始等权；周期刷新任务（fusion_refresh，P2-4 重建，旧任务随 6c469eb7
+            # 删除）按成员近窗 IC 动态刷新 weight_snapshot.json
+            weights = {str(s["model_id"]): 1.0 / len(sources) for s in sources}
+        else:
+            weights = {str(s["model_id"]): 1.0 / len(sources) for s in sources}
+
+        # 从源模型 context 汇总市场（取出现最多的），用于 model_id 与存储分段
+        benchmark = "SH000300"
+        context: dict[str, Any] = {}
+        for src in sources:
+            meta = self._parse_json_field(src.get("metadata_json"))
+            ctx = meta.get("context")
+            if isinstance(ctx, dict):
+                context.update(ctx)
+        market = str(context.get("market") or "CN").upper()
+
+        # 生成 model_id
+        now = datetime.now(timezone.utc)
+        ts = now.strftime("%Y%m%d%H%M%S")
+        digest = hashlib.sha1(
+            "|".join(sorted(source_model_ids)).encode("utf-8")
+        ).hexdigest()[:8]
+        model_id = f"mdl_{market.lower()}_ensemble_{ts}_{digest}"
+
+        # 构建元数据
+        source_meta_list = []
+        for src in sources:
+            meta = self._parse_json_field(src.get("metadata_json"))
+            metrics = self._parse_json_field(src.get("metrics_json"))
+            source_meta_list.append(
+                {
+                    "model_id": str(src["model_id"]),
+                    "model_name": meta.get("display_name")
+                    or meta.get("model_name")
+                    or str(src["model_id"]),
+                    "model_type": meta.get("model_type"),
+                    "framework": meta.get("framework"),
+                    "target_horizon_days": meta.get("target_horizon_days"),
+                    "feature_count": meta.get("feature_count"),
+                    "weight": round(weights.get(str(src["model_id"]), 0), 6),
+                    "metrics": metrics,
+                }
+            )
+
+        # 特征并集
+        unified_features: list[str] = []
+        for src in sources:
+            meta = self._parse_json_field(src.get("metadata_json"))
+            feats = meta.get("feature_columns") or meta.get("features") or []
+            for f in feats:
+                if f not in unified_features:
+                    unified_features.append(f)
+        feature_count = len(unified_features)
+
+        raw_display_name = str(display_name or "").strip() or "融合模型"
+        if not raw_display_name.upper().endswith(f"_{market}"):
+            raw_display_name = f"{raw_display_name}_{market}"
+
+        # 数据面继承（绝不硬编码 parquet，见 _inherit_data_plane_from_members）——
+        # 融合模型与成员必须读同一面数据，否则 runner 会按错误的数据源路由
+        # （表现为「能推理但读停更快照」）。
+        source_metas = [
+            self._parse_json_field(s.get("metadata_json")) for s in sources
+        ]
+        data_plane, plane_warnings = _inherit_data_plane_from_members(source_metas)
+        for warn in plane_warnings:
+            logger.warning("融合模型数据面提示: %s", warn)
+
+        metadata: dict[str, Any] = {
+            "model_type": "ensemble",
+            "model_name": raw_display_name,
+            "display_name": raw_display_name,
+            "ensemble_method": "fusion",
+            "is_ensemble": True,
+            "model_file": "ensemble_config.json",
+            "framework": "ensemble",
+            "fusion_strategy": fusion_strategy,
+            "strategy_config": strategy_config or {},
+            "source_models": source_meta_list,
+            "source_model_ids": [str(s["model_id"]) for s in sources],
+            "weight_strategy": weight_strategy,
+            "weights": {
+                str(s["model_id"]): round(weights.get(str(s["model_id"]), 0), 6)
+                for s in sources
+            },
+            "feature_count": feature_count,
+            "features": unified_features,
+            "feature_columns": unified_features,
+            "context": context,
+            "benchmark": benchmark,
+            "market": market,
+            "target_horizon_days": int(target_horizon_days or 15),
+            "target_mode": "return",
+            **data_plane,
+            "generated_at": now.isoformat(),
+            "metrics": {
+                "val_ic": 0.0,
+                "test_ic": 0.0,
+                "score_direction": "normal",
+            },
+        }
+        if plane_warnings:
+            metadata["data_plane_warnings"] = plane_warnings
+
+        # 创建模型目录（非 CN 市场按市场子目录分段）
+        model_dir = self.user_models_root / tenant / user / model_id
+        if market and market != "CN":
+            model_dir = (
+                self.user_models_root / tenant / user / market.lower() / model_id
+            )
+        model_dir.mkdir(parents=True, exist_ok=True)
+
+        # 写入 ensemble_config.json（源模型用绝对路径）
+        ensemble_config = {
+            "version": 2,
+            "created_at": now.isoformat(),
+            "weight_strategy": weight_strategy,
+            "fusion_strategy": fusion_strategy,
+            "strategy_config": strategy_config or {},
+            "horizon_days": int(target_horizon_days or 15),
+            "weights": {
+                str(k): round(float(v), 6) for k, v in weights.items()
+            },
+            "models": [
+                {
+                    "model_id": str(s["model_id"]),
+                    "model_dir": str(
+                        Path(
+                            s.get("storage_path")
+                            or (
+                                self.user_models_root
+                                / tenant
+                                / user
+                                / str(s["model_id"])
+                            )
+                        ).resolve()
+                    ),
+                    "weight": round(weights.get(str(s["model_id"]), 0), 6),
+                    "target_horizon_days": self._parse_json_field(
+                        s.get("metadata_json")
+                    ).get("target_horizon_days"),
+                    "feature_count": self._parse_json_field(s.get("metadata_json")).get(
+                        "feature_count"
+                    ),
+                }
+                for s in sources
+            ],
+        }
+        (model_dir / "ensemble_config.json").write_text(
+            json.dumps(ensemble_config, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        (model_dir / "metadata.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        # 部署融合推理脚本（从模板复制，避免被 parquet 模板覆盖）
+        template_path = (
+            Path(__file__).parent.parent
+            / "services"
+            / "engine"
+            / "inference"
+            / "templates"
+            / "inference_ensemble_src.py"
+        )
+        if template_path.is_file():
+            shutil.copy2(template_path, model_dir / "inference.py")
+        else:
+            logger.warning("融合推理模板不存在: %s，模型推理可能失败", template_path)
+
+        # v2 权重快照（模板 _load_dynamic_weights 兼容嵌套格式）+ 审计流水 + 回放结论。
+        # 原子写：推理进程可能随时在读，绝不允许半截 JSON。
+        snapshot = {
+            "version": 2,
+            "as_of": now.date().isoformat(),
+            "strategy": str(weight_strategy),
+            "weights": {str(k): round(float(v), 6) for k, v in weights.items()},
+            "diagnostics": weight_diagnostics or [],
+            "updated_at": now.isoformat(),
+        }
+        snap_path = model_dir / "weight_snapshot.json"
+        snap_tmp = snap_path.with_suffix(".json.tmp")
+        snap_tmp.write_text(
+            json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        snap_tmp.replace(snap_path)
+        with (model_dir / "weight_history.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "as_of": snapshot["as_of"],
+                        "strategy": snapshot["strategy"],
+                        "weights": snapshot["weights"],
+                        "event": "created",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+        if fusion_eval is not None:
+            eval_path = model_dir / "fusion_eval.json"
+            eval_tmp = eval_path.with_suffix(".json.tmp")
+            eval_tmp.write_text(
+                json.dumps(fusion_eval, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            eval_tmp.replace(eval_path)
+
+        # 写库
+        now_db = datetime.now(timezone.utc)
+        async with get_session() as session:
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO qm_user_models (
+                        tenant_id, user_id, model_id, source_run_id, status, storage_path, model_file,
+                        metadata_json, metrics_json, is_default, created_at, updated_at, activated_at
+                    ) VALUES (
+                        :tenant_id, :user_id, :model_id, :source_run_id, 'ready', :storage_path, :model_file,
+                        CAST(:metadata_json AS JSONB), CAST(:metrics_json AS JSONB), FALSE,
+                        :created_at, :updated_at, :activated_at
+                    )
+                    ON CONFLICT (tenant_id, user_id, model_id) DO UPDATE SET
+                        status = 'ready',
+                        storage_path = EXCLUDED.storage_path,
+                        model_file = EXCLUDED.model_file,
+                        metadata_json = EXCLUDED.metadata_json,
+                        metrics_json = EXCLUDED.metrics_json,
+                        updated_at = EXCLUDED.updated_at
+                    """
+                ),
+                {
+                    "tenant_id": tenant,
+                    "user_id": user,
+                    "model_id": model_id,
+                    "source_run_id": f"ensemble_{ts}",
+                    "storage_path": str(model_dir.resolve()),
+                    "model_file": "ensemble_config.json",
+                    "metadata_json": json.dumps(metadata, ensure_ascii=False),
+                    "metrics_json": json.dumps(
+                        {"val_ic": 0.0, "test_ic": 0.0}, ensure_ascii=False
+                    ),
+                    "created_at": now_db,
+                    "updated_at": now_db,
+                    "activated_at": now_db,
+                },
+            )
+
+            # 若无业务默认模型，设为默认
+            has_business_default = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT 1
+                        FROM qm_user_models
+                        WHERE tenant_id = :tenant_id AND user_id = :user_id
+                          AND is_default = TRUE
+                          AND COALESCE((metadata_json->>'system_default')::boolean, FALSE) = FALSE
+                        LIMIT 1
+                        """
+                    ),
+                    {"tenant_id": tenant, "user_id": user},
+                )
+            ).first()
+            if not has_business_default:
+                await session.execute(
+                    text(
+                        """
+                        UPDATE qm_user_models
+                        SET is_default = FALSE, updated_at = :updated_at
+                        WHERE tenant_id = :tenant_id AND user_id = :user_id AND is_default = TRUE
+                        """
+                    ),
+                    {"tenant_id": tenant, "user_id": user, "updated_at": now_db},
+                )
+                await session.execute(
+                    text(
+                        """
+                        UPDATE qm_user_models
+                        SET is_default = TRUE, activated_at = :activated_at, updated_at = :updated_at
+                        WHERE tenant_id = :tenant_id AND user_id = :user_id AND model_id = :model_id
+                        """
+                    ),
+                    {
+                        "tenant_id": tenant,
+                        "user_id": user,
+                        "model_id": model_id,
+                        "activated_at": now_db,
+                        "updated_at": now_db,
+                    },
+                )
+
+        # 创建即进日更推理名单 —— 历史「融合模型没有预测能力」的根因就是缺这一行
+        # （qm_model_inference_dispatch_logs 零 ensemble 行）。写入失败不阻断创建，
+        # 但必须以 daily_inference.error 显式外露，不许静默。
+        daily_inference: dict[str, Any] = {"enabled": False, "error": None}
+        try:
+            from backend.services.engine.services.model_inference_persistence import (
+                model_inference_persistence,
+            )
+
+            await model_inference_persistence.update_settings(
+                tenant_id=tenant, user_id=user, model_id=model_id, enabled=True
+            )
+            daily_inference["enabled"] = True
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("融合模型 %s 未能写入日更推理名单", model_id)
+            daily_inference["error"] = str(exc)
+
+        logger.info(
+            "[%s] 融合模型已创建: %s (%d 个源模型, 权重策略=%s, 日更=%s)",
+            model_id,
+            raw_display_name,
+            len(sources),
+            weight_strategy,
+            daily_inference["enabled"],
+        )
+        return {
+            "model_id": model_id,
+            "status": "ready",
+            "storage_path": str(model_dir.resolve()),
+            "model_file": "ensemble_config.json",
+            "metadata": metadata,
+            "daily_inference": daily_inference,
+        }
+
+    def _sync_candidate_artifacts(
+        self,
+        *,
+        run_id: str,
+        tenant_id: str,
+        user_id: str,
+        model_id: str,
+        target_dir: Path,
+    ) -> tuple[str, str, str]:
+        artifact_names = [
+            "model.lgb",
+            "model.xgb",
+            "model.cbm",
+            "model.pkl",
+            "model.pth",
+            "model.txt",
+            "model.bin",
+            # Stacking 基模型命名: model_xgb.xgb, model_lgb.lgb 等
+            "model_xgb.xgb",
+            "model_xgb.pkl",
+            "model_lgb.lgb",
+            "model_lgb.txt",
+            "model_cbm.cbm",
+            "model_lin.pkl",
+            "meta_model.pkl",
+            "model_p10.lgb",
+            "model_p50.lgb",
+            "model_p90.lgb",
+            "metadata.json",
+            "pred.parquet",
+            "pred.pkl",
+            "config.yaml",
+            "result.json",
+            "inference.py",
+            "shap_summary.csv",
+        ]
+
+        # 任务工作目录：容器部署沿用 /data/training_jobs/{run_id}；
+        # 便携包等免 Docker 部署按 STORAGE_ROOT 落位（与本地直跑编排器写盘同源）
+        from backend.shared.training_runtime import training_jobs_dir
+
+        job_dir = training_jobs_dir(run_id)
+
+        # 多模型模式：metadata.json 里 saved_models 记录了全部基模型文件名
+        # （model_gru.pth / model_mlp.pkl 等新后缀名不在静态白名单），动态展开补全；
+        # 同时带上训练端为每个基模型独立写出的 pred_{type}.parquet，
+        # 拆分（split_multi_model_entries）要靠它给子模型自己的预测。
+        for predefined_dir in (target_dir, job_dir):
+            meta_path = predefined_dir / "metadata.json"
+            if meta_path.is_file():
+                try:
+                    saved = json.loads(meta_path.read_text(encoding="utf-8")).get("saved_models") or {}
+                    artifact_names.extend(
+                        v for v in saved.values() if v not in artifact_names
+                    )
+                    artifact_names.extend(
+                        f"pred_{mtype}.parquet"
+                        for mtype in saved
+                        if f"pred_{mtype}.parquet" not in artifact_names
+                    )
+                except Exception:
+                    pass
+                break
+
+        copied: list[str] = []
+        for source_dir in (target_dir, job_dir):
+            if not source_dir.exists() or not source_dir.is_dir():
+                continue
+            for filename in artifact_names:
+                src = source_dir / filename
+                if not src.is_file():
+                    continue
+                dest = target_dir / filename
+                if src.resolve() == dest.resolve():
+                    continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dest)
+                copied.append(filename)
+
+        model_file = ""
+        for candidate in (
+            "model.lgb",
+            "model.xgb",
+            "model.cbm",
+            "model.pkl",
+            "model.pth",
+            "model.txt",
+            "model.bin",
+            "model_xgb.xgb",
+            "model_lgb.lgb",
+            "model_cbm.cbm",
+            "model_lin.pkl",
+            "meta_model.pkl",
+        ):
+            if (target_dir / candidate).exists():
+                model_file = candidate
+                break
+
+        if (target_dir / "metadata.json").exists() and model_file:
+            self._reconcile_metadata_model_file(target_dir, model_file)
+            return "ready", "", model_file
+
+        cos = get_cos_service()
+        source_prefix = f"models/candidates/{run_id}/"
+        for filename in artifact_names:
+            key = f"{source_prefix}{filename}"
+            try:
+                data = cos.get_object_bytes(key)
+                if data is None:
+                    continue
+                dest = target_dir / filename
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(data)
+                copied.append(filename)
+            except Exception:
+                continue
+
+        for candidate in (
+            "model.lgb",
+            "model.xgb",
+            "model.cbm",
+            "model.pkl",
+            "model_xgb.xgb",
+            "model_lgb.lgb",
+            "model_cbm.cbm",
+            "meta_model.pkl",
+            "model.txt",
+            "model.bin",
+        ):
+            if (target_dir / candidate).exists():
+                model_file = candidate
+                break
+
+        if not copied:
+            return (
+                "failed",
+                "no artifacts found in local training workspace or COS path",
+                model_file,
+            )
+
+        self._reconcile_metadata_model_file(target_dir, model_file)
+        return "ready", "", model_file
+
+    @staticmethod
+    def _reconcile_metadata_model_file(target_dir: Path, model_file: str) -> None:
+        """把 metadata.json 的 `model_file` 校准成磁盘上真实存在的权重名。
+
+        训练端 metadata 记的是 per-algorithm 名（model_gru.pth / model_nativetft.pth），
+        而产物同步按白名单落成通用名（model.pth）。两者不一致时推理脚本找不到声明文件，
+        就退到「按扩展名盲搜模型目录」，线上曾因此把预测产物 pred.pkl 当成模型加载，
+        全部 DL 模型推理失败。在模型落盘时一次性对齐，DB 列与 metadata 从此同源。
+        """
+        if not model_file:
+            return
+        meta_path = target_dir / "metadata.json"
+        if not meta_path.is_file():
+            return
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            logger.warning("校准 model_file 失败（metadata.json 无法解析）: %s", meta_path)
+            return
+        if not isinstance(meta, dict):
+            return
+        declared = str(meta.get("model_file") or "").strip()
+        # 声明名已经对得上就不动它（人工放进去的权重名同样受保护）
+        if declared == model_file or (declared and (target_dir / declared).is_file()):
+            return
+        meta["model_file"] = model_file
+        meta_path.write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        logger.info(
+            "metadata.model_file 已校准: %s → %s (%s)",
+            declared or "(空)", model_file, target_dir.name,
+        )
+
+    @staticmethod
+    def _extract_test_rank_icir(metadata: dict, metrics: dict) -> float | None:
+        """从模型 metadata/metrics 提取 test 集 Rank ICIR（样本外验证指标）。
+
+        P0-4 起统一走样本外口径契约（model_eval_contract.resolve_oos_metrics）：
+        `eval_report.by_split.test.icir` 优先，扁平 `test_rank_icir` 仅作老批次
+        回退；headline / train / valid 段永不参与（合并窗口实测虚高 1.47×）。
+        无法确定时返回 None（软门禁不生效，模型按原流程进入 ready）。
+        """
+        from backend.shared.model_eval_contract import resolve_oos_metrics
+
+        return resolve_oos_metrics(metadata, metrics).get("rank_icir")
+
+    @staticmethod
+    def _extract_test_rank_ic(metadata: dict, metrics: dict) -> float | None:
+        """从训练 metadata/metrics 提取 test 集 Rank IC（口径同 `_extract_test_rank_icir`）。"""
+        from backend.shared.model_eval_contract import resolve_oos_metrics
+
+        return resolve_oos_metrics(metadata, metrics).get("rank_ic")
+
+    @staticmethod
+    def _validate_synced_model(
+        *,
+        target_dir: Path,
+        model_file: str,
+        request_payload: dict[str, Any],
+    ) -> str:
+        if not model_file or not (target_dir / model_file).exists():
+            return "model file missing after sync"
+        metadata_path = target_dir / "metadata.json"
+        if not metadata_path.exists():
+            return "metadata.json missing after sync"
+
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if not isinstance(metadata, dict):
+                return "metadata.json is not a valid object"
+        except Exception as exc:
+            return f"metadata.json parse failed: {exc}"
+
+        feature_dim = metadata.get("feature_count")
+        if feature_dim is None:
+            features = metadata.get("features")
+            if isinstance(features, list):
+                feature_dim = len(features)
+        try:
+            if int(feature_dim or 0) <= 0:
+                return "metadata feature dimension is missing"
+        except Exception:
+            return "metadata feature dimension is invalid"
+
+        target_horizon_days = request_payload.get("target_horizon_days")
+        target_mode = request_payload.get("target_mode")
+        if int(target_horizon_days or 0) <= 0:
+            return "target_horizon_days is missing in request payload"
+        if str(target_mode or "").strip() == "":
+            return "target_mode is missing in request payload"
+
+        return ""
+
+
+model_registry_service = ModelRegistryService()

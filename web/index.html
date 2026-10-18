@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>AutoAlpha · 因子研究工作台</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
+    <style>
+      html, body, #root {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        font-family: Inter, "Noto Sans SC", -apple-system, BlinkMacSystemFont,
+          "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        background: #e2e8f0;
+      }
+      /* 挂载完成前的加载态，与主应用 index.html 保持一致 */
+      .qm-boot {
+        min-height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .qm-boot-spinner {
+        width: 28px;
+        height: 28px;
+        border: 3px solid rgba(100, 116, 139, 0.28);
+        border-top-color: #475569;
+        border-radius: 50%;
+        animation: qmSpin 1s linear infinite;
+      }
+      @keyframes qmSpin {
+        to { transform: rotate(360deg); }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <div class="qm-boot">
+        <div class="qm-boot-spinner" aria-label="Loading"></div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

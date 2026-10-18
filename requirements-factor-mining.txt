@@ -1,0 +1,58 @@
+# 因子挖掘独立后端依赖（WSL / Python 3.12；pyqlib 目前没有 Python 3.13+ wheel）
+# 分层依据：静态导入图审计（模块级 import = 必须装；函数内 import = 按需）
+# ---------------------------------------------------------------------------
+
+# ── 基础 / Web ──
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+python-multipart>=0.0.9
+pydantic[email]>=2.6.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
+httpx>=0.27.0
+aiofiles>=23.2.1
+tenacity>=8.2.3
+structlog>=24.1.0
+prometheus_client>=0.20.0
+jinja2>=3.1.0
+
+# ── 计算 ──
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.11.0
+statsmodels>=0.14.0
+pyarrow>=15.0.0
+
+# ── 存储 ──
+sqlalchemy>=2.0.25
+greenlet>=3.0.0
+asyncpg>=0.29.0
+psycopg2-binary>=2.9.9
+redis>=5.0.1
+duckdb>=1.1.0
+
+# ── Qlib（统计派取数必需；只有 cp38~cp312 wheel，故解释器须 3.12）──
+pyqlib==0.9.7
+lightgbm>=4.0.0
+
+# ── 认证（engine + api 两侧中间件同口径）──
+pyyaml>=6.0
+pyjwt>=2.8.0
+bcrypt==4.0.1  # passlib 1.7.4 的兼容版本；bcrypt 5.x 会破坏密码校验路径
+passlib[bcrypt]>=1.7.4
+python-jose[cryptography]>=3.3.0
+user-agents>=2.2.0
+
+# ── 文档挖掘链（T-FM-07，ENABLE_DOC_MINING=true 时才走）──
+psutil>=5.9.0
+Pillow>=10.0.0
+pypdf>=4.0.0
+
+# ── 可选：投研/训练聚合层（research.py、research_service.py 的运行期依赖）──
+# 独立跑因子挖掘不必装；命中这些端点才需要。
+# duckdb>=1.1.0
+# aiohttp>=3.9.0
+# lightgbm>=4.0.0
+# xgboost>=2.0.0
+# catboost>=1.2.0
+# pyqlib==0.9.7        # 仅 x86_64/AMD64，AMD 上有 AVX 要求

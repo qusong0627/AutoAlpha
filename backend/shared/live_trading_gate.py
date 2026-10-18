@@ -1,0 +1,354 @@
+"""实盘交易闸门（`ENABLE_REAL_TRADING`）：单一咽喉点，默认关闭。
+
+为什么是两层，而不是一层
+------------------------
+实盘面在代码里有两种形态，用同一种手法拦不住：
+
+1. **专有端点** —— 整个 router 只服务实盘（`/api/v1/orders`、`/qmt-mirror/*`、
+   `/broker-config/*`、`/tdx/push-signals` …）。这类由**中间件**按 (方法, 路径)
+   判定，新加的路由默认落在拒绝侧，漏挂依赖也不会漏拦。
+
+2. **双模式共用端点** —— 同一个 URL 的 REAL 与 SIMULATION 走同一段代码，
+   模式在 **query / body** 里（`/api/v1/real-trading/preflight`、`/trading-precheck`、
+   `/start`、`/manual-executions`）。中间件读不到 body（读了会耗尽请求流），
+   按前缀整段拦又会把**模拟盘启动链路**一起打死。
+   这类由 `ensure_real_trading_allowed()` 在 handler 内按模式判定。
+
+   ⚠️ 正因如此，`_BLOCKED_PREFIXES` 里**没有** `f"{_API}/real-trading"`。
+   那个 router 名字叫 real-trading，实际是**两种模式共用的策略运行台**：
+   模拟盘部署时前端一样要调 `/preflight`、`/trading-precheck`、`/start`、
+   `/manual-executions`。按前缀拦掉它 = 模拟盘点「启动」直接 403。
+
+对外命名空间（`/api/ext/v1`）单独一套策略
+------------------------------------------
+上面那种「中间件按前缀拦」的手法**只覆盖 `/api/v1`**：两张表里每个字面量都以
+`/api/v1` 开头，边界又落在 `/` 上，所以 `/api/ext/v1/...` 对不上任何一条，
+默认是**可达**的。对外命名空间因此不走前缀拒绝表，而是单独走
+「登记过才放行、没登记就拒绝」（见 `_ALLOWED_EXT_ENDPOINTS` 上方注释）。
+新加对外端点必须来这里登记一行，`backend/tests/test_external_api_gate_coverage.py`
+会强制这件事，并且用「运行时新加的路由」证明默认拒绝真的生效。
+
+只拦交易，绝不拦行情
+--------------------
+用户明确要求实时行情保留。`/api/v1/tdx/*` 同一前缀下混着行情与交易
+（`/tdx/quote-feed` 与 `/tdx/push-signals` 是两回事），所以判定必须落到**端点**
+而不是前缀——按前缀拦会把盘中行情主源（TDX 桥热集行情、`market:snapshot/series`
+的写侧）一起打死。行情端点在 `_MARKET_DATA_PREFIXES` 里逐条列出并**优先于拒绝表**
+判定，`backend/tests/test_live_trading_gate.py` 有对应的「不许误杀」断言。
+
+与 `ENABLE_REAL_TRADING` 的关系
+--------------------------------
+与 `backend/services/trade_shared/trade_config.py::ENABLE_REAL_TRADING` 读**同一个
+环境变量**，且共用**同一份读取实现**（`backend/shared/env_flags.py`）—— 这里曾经
+是「各写一份」：闸门 `strip().lower()`、settings 只有 `lower()` 且由 pydantic
+自己解析，实测分叉出「闸门放行而 settings 抛 ValidationError」（`" true "`）与
+「闸门判关而 settings 判开」（`"1"`/`"yes"`/`"on"`）两类。同一个开关有两种答案时，
+运维看到的和引擎执行的可以不是同一件事，故收敛为一份（分叉矩阵见 `env_flags`）。
+
+前端另有构建期开关 `VITE_ENABLE_REAL_TRADING`（`electron/src/config/tradingFlags.ts`）
+管「渲染不渲染」；本模块管「端点通不通」。恢复实盘必须两端同时打开。
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+
+from backend.shared.env_flags import env_flag
+
+logger = logging.getLogger(__name__)
+
+ENV_KEY = "ENABLE_REAL_TRADING"
+
+#: 闸门拒绝时返回的机器可读原因（前端/探针据此断言，不要改字面量）
+DISABLED_DETAIL = "real_trading_disabled"
+
+_API = "/api/v1"
+
+# ---------------------------------------------------------------------------
+# 行情面：无条件放行（优先于下面所有拒绝规则判定）
+# ---------------------------------------------------------------------------
+
+#: 行情/数据面端点前缀。**盘中行情主源，误杀会直接断数据。**
+#: - `/tdx/quote-*`：TDX 桥热集行情轮询与逐笔
+#: - `/tdx/l2*`：L2 行情与 L2 通道配置（行情侧，非交易侧）
+#: - `/tdx/config`：桥地址/token——行情通道与交易通道共用同一座桥，
+#:   拦住它会让行情桥也配不了
+_MARKET_DATA_PREFIXES: tuple[str, ...] = (
+    f"{_API}/tdx/config",
+    f"{_API}/tdx/overview",
+    f"{_API}/tdx/quote-feed",
+    f"{_API}/tdx/quote-tick",
+    f"{_API}/tdx/quote-ticks",
+    f"{_API}/tdx/l2",
+    f"{_API}/tdx/l2-config",
+    f"{_API}/market",
+    f"{_API}/ws",
+)
+
+# ---------------------------------------------------------------------------
+# 拒绝表（实盘关闭时）：专有端点，不分方法一律拒绝
+# ---------------------------------------------------------------------------
+
+_BLOCKED_PREFIXES: tuple[str, ...] = (
+    # 实盘委托。该 router 直接依赖 live_trading.services.trading_engine；
+    # 模拟盘委托走的是另一条路径 `/api/v1/simulation/orders`，不受影响。
+    f"{_API}/orders",
+    # 大 QMT 真单镜像与止损止盈
+    f"{_API}/qmt-mirror",
+    f"{_API}/qmt-sltp",
+    # 券商接入：含凭证面。`/broker-config-status` 是独立路径，前缀匹配够不着，
+    # 必须单列（`_matches` 的边界落在 `/` 上，不会把 `-status` 一起吞掉）
+    f"{_API}/broker-config",
+    f"{_API}/broker-config-status",
+    # 信号下发券商 / 自动交易配置
+    f"{_API}/tdx/push-signals",
+    f"{_API}/tdx/rolling-signals",
+    f"{_API}/tdx/rolling-config",
+    f"{_API}/tdx/sltp-config",
+    # 券商侧委托查询与撤单
+    f"{_API}/tdx/orders",
+    f"{_API}/tdx/inflight",
+)
+
+#: 精确 (方法, 路径) 拒绝。用于按前缀拦会误伤、但确实只服务实盘的端点。
+#: 这几条在前端**没有任何调用方**（`grep -rn` 已核），拦掉不会伤模拟盘。
+_BLOCKED_EXACT: frozenset[tuple[str, str]] = frozenset(
+    {
+        # 实盘券商委托流水与历史（模拟盘的成交查询走 `/api/v1/simulation/orders`
+        # 与 `/api/v1/trades`，与本条无关）
+        ("GET", f"{_API}/real-trading/orders"),
+        ("GET", f"{_API}/real-trading/history"),
+        # 实盘账户初始资金等参数，改了直接影响真钱账本
+        ("PUT", f"{_API}/real-trading/account/settings"),
+        # 实盘撤单。`GET /risk/status` 与 `POST /risk/config` **放行**——
+        # 风控对模拟盘同样生效，且配置面属于页面骨架，拦掉只会让界面报错，
+        # 不会多挡住任何一笔真单
+        ("POST", f"{_API}/risk/cancel-all"),
+    }
+)
+
+# 对外命名空间（`/api/ext/v1`）：**未登记即拒绝**
+# ---------------------------------------------------------------------------
+#
+# 上面两张表里每个字面量都以 `/api/v1` 开头，`_matches` 的边界又落在 `/` 上。
+# 于是对外命名空间里的路径**对不上任何一条**，`is_blocked()` 返回 False ——
+# 默认可达。这跟本模块承诺的「新路由默认落在拒绝侧」正好相反。
+#
+# 修法不是「往拒绝表里补几条对外路径」（那样下一个新端点又会漏），而是在对外
+# 命名空间里把失败方向**翻过来**：登记过的才放行，没登记的一律拒绝。
+# 代价是每加一个对外端点都要来这儿登记一行——这正是想要的摩擦。
+
+#: 对外命名空间。**唯一出处**：对外 router 从这里 import 前缀，不各写一份。
+EXT_API = "/api/ext/v1"
+
+#: 对外命名空间的实盘拒绝表（与 `/api/v1` 同构）。
+#:
+#: ⚠️ **仍然为空，这是批次 4（控制/任务/交易面）落地后的刻意结论，不是忘了填。**
+#:
+#: 对外交易面**只开了模拟盘**，路径是 `/api/ext/v1/trading/sim/…`。往这张表里
+#: 写一个 `/api/ext/v1/trading`（看起来最自然的那一行）会**连带打死模拟盘**——
+#: 本表是前缀语义（`_matches`，边界落在 `/`），而 OSS 默认
+#: `ENABLE_REAL_TRADING=false`，也就是**每一个** OSS 部署上模拟交易都会 403。
+#: 那是一个比「实盘没关住」更糟的结果：模拟盘恰恰是实盘关闭时唯一该能用的东西。
+#:
+#: 所以规矩是：**拒绝表只登记实盘侧端点，且登记的前缀不得覆盖 `trading/sim/`。**
+#: 等真加了对外实盘端点（幂等补齐后单独一批），把它们的**实盘专用段**
+#: （如 `/api/ext/v1/trading/real`）写进来，不要图省事写父路径。
+#: `test_external_api_gate_coverage.py::test_blocked_prefix_never_covers_simulation`
+#: 会拿具体路径逐条跑一遍判定，把这条钉死。
+_BLOCKED_EXT_PREFIXES: tuple[str, ...] = ()
+
+#: 对外命名空间的**显式放行**表。不在这张表里、也不在拒绝表里 = 拒绝。
+#:
+#: ⚠️ 判定是**精确相等**（`path in ...`），不是 `_matches` 前缀匹配。
+#: 第一版用了前缀匹配并声称「写多深，放行就止于多深」——那是**假的**：
+#: `_matches` 的边界落在 `/` 上，登记 `/auth/session` 会连带放行
+#: `/auth/session/anything`。于是「每加一个对外端点都要来这儿登记一行」这条
+#: 承诺被架空：将来 `/auth/session/rotate` 之类**不会**触发未登记即拒绝。
+#: 对外面每个端点都是独立契约，没有需要前缀语义的场景，所以按端点精确登记。
+_ALLOWED_EXT_ENDPOINTS: tuple[str, ...] = (
+    f"{EXT_API}/auth/session",
+    f"{EXT_API}/capabilities",
+    # 数据面（批次 3）。不带路径参数的那几条走精确表，带参数的走下面的模式表。
+    f"{EXT_API}/data/datasets",
+    # 控制面（批次 4）——只读，不碰交易。
+    f"{EXT_API}/control/strategies",
+    f"{EXT_API}/control/models",
+    # 任务面（批次 4）的「有哪些任务种类」。提交/查询带参数，走下面的模式表。
+    f"{EXT_API}/task/kinds",
+)
+
+#: 带**路径参数**的对外端点。上面那张表是精确相等，表达不了
+#: `/data/{dataset}/changes` 这类形状——而数据面几乎每个端点都有参数。
+#:
+#: 为什么不是「整段前缀放行」（`/api/ext/v1/data/`）：那正是上一条注释里说的
+#: 架空。模式必须**逐段写死**：参数位用窄字符类（`[a-z0-9_]+`，与数据面注册表
+#: 的标识符形状同源），其余每一段都是字面量，两端锚死。
+#:
+#: `fullmatch` 而非 `match`：不加 `$` 锚的 `match` 会放行
+#: `/api/ext/v1/data/x/changes/../../orders` 这类带尾巴的路径。
+_ALLOWED_EXT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # 分区清单 / 取文件
+    re.compile(rf"{EXT_API}/data/datasets/[a-z0-9_]+/partitions"),
+    re.compile(
+        rf"{EXT_API}/data/datasets/[a-z0-9_]+/partitions/"
+        r"\d{4}-\d{2}-\d{2}/file"
+    ),
+    # 单文件数据集
+    re.compile(rf"{EXT_API}/data/datasets/[a-z0-9_]+/blob"),
+    # 行级增量（游标）——**不碰交易**，所以放行；放行的是「读」，不是「下单」
+    re.compile(rf"{EXT_API}/data/[a-z0-9_]+/changes"),
+    # 任务面：提交 / 查状态。`{kind}` 是窄字符类（它只会是 `train` 这类
+    # snake_case 标识），`{ref}` 是作业 id——上游的 id 有 uuid4().hex[:16]、
+    # `str(uuid4())[:8]`、数字自增等好几种形状，所以字符类放宽到
+    # `[A-Za-z0-9_.-]`，但**仍然逐段锚死**：路径参数里出现 `/` 就匹配不上。
+    re.compile(rf"{EXT_API}/task/[a-z_]+"),
+    re.compile(rf"{EXT_API}/task/[a-z_]+/[A-Za-z0-9_.-]+"),
+    # 交易面：**只有模拟盘**，且 id 位是 UUID 的标准 36 字符形（不是 `[^/]+`）。
+    # 窄是有意的——这层宽一格，「未登记即拒绝」就松一格。
+    re.compile(rf"{EXT_API}/trading/sim/(account|trades|orders)"),
+    re.compile(rf"{EXT_API}/trading/sim/orders/[0-9a-fA-F-]{{36}}"),
+    re.compile(rf"{EXT_API}/trading/sim/orders/[0-9a-fA-F-]{{36}}/cancel"),
+)
+
+
+# ---------------------------------------------------------------------------
+# 模式判定（双模式共用端点用）
+# ---------------------------------------------------------------------------
+
+#: **认得出**的模拟盘写法。除此之外一律算实盘侧。
+_SIMULATION_TOKENS = frozenset(
+    {"simulation", "sim", "paper", "模拟", "模拟盘", "虚拟盘"}
+)
+
+
+def is_real_trading_enabled() -> bool:
+    """实盘是否启用。**调用时读 env**（不是 import 时冻结）——
+    测试要能 monkeypatch，运维改 env 重启即生效，没有中间态。
+
+    读法与 `trade_config.ENABLE_REAL_TRADING` 共用 `shared/env_flags`（见模块
+    docstring「与 ENABLE_REAL_TRADING 的关系」）：两份实现已实测分叉过。
+    """
+    return env_flag(ENV_KEY)
+
+
+def _normalize(path: str) -> str:
+    """去尾斜杠。`/api/v1/orders` 与 `/api/v1/orders/` 必须同判。"""
+    return path.rstrip("/") or "/"
+
+
+def _matches(path: str, prefix: str) -> bool:
+    """前缀匹配，但边界必须落在 `/` 上：`/api/v1/orders` 不该匹配 `/api/v1/orders-x`。"""
+    return path == prefix or path.startswith(prefix + "/")
+
+
+def is_blocked(method: str, path: str) -> bool:
+    """该请求在实盘关闭时是否应被拒绝。纯函数，便于单测与审计。"""
+    method = method.upper()
+    path = _normalize(path)
+
+    # 0) 对外命名空间自成一域：单独一套策略，先判、判完就返回。
+    #    放在最前面是刻意的——避免将来往 `/api/v1` 的表里加东西时，
+    #    有人以为它也会自动覆盖对外面。
+    if _matches(path, EXT_API):
+        if any(_matches(path, p) for p in _BLOCKED_EXT_PREFIXES):
+            return True
+        # 未登记即拒绝（fail-closed）。新加对外端点若忘了登记，
+        # 表现是「实盘关闭的部署上 403」，而不是「悄悄可达」。
+        # 放行侧用精确相等——见 `_ALLOWED_EXT_ENDPOINTS` 上方那段：
+        # 前缀匹配会让「登记一个端点」顺带放行它的整棵子树。
+        if path in _ALLOWED_EXT_ENDPOINTS:
+            return False
+        # 带路径参数的端点走模式表（形状同样是逐段写死的，见其上方注释）
+        return not any(p.fullmatch(path) for p in _ALLOWED_EXT_PATTERNS)
+
+    # 1) 行情先行：无论什么方法，行情端点一律放行
+    if any(_matches(path, p) for p in _MARKET_DATA_PREFIXES):
+        return False
+
+    # 2) 精确拒绝
+    if (method, path) in _BLOCKED_EXACT:
+        return True
+
+    # 3) 整段拒绝
+    return any(_matches(path, p) for p in _BLOCKED_PREFIXES)
+
+
+def is_real_side_mode(raw: object) -> bool:
+    """该交易模式是否属于「实盘侧」（REAL / SHADOW / 无法识别的写法）。
+
+    **只认得出模拟盘的写法才算模拟盘**，其余一律算实盘侧——与中间件「新路由默认
+    落在拒绝侧」同一个失败方向。
+
+    ⚠️ 这与前端 `normalizeTradingMode` 的归一方向**正好相反**，是有意的：
+    前端未知判模拟，为的是「宁可少认一个实盘」（别把模拟部署显示成实盘）；
+    这里未知判实盘，为的是「宁可多拦一个」（别让没见过的写法绕过闸门）。
+    两者各守一端，都是安全的失败方向。
+
+    SHADOW 归入实盘侧：它虽不下真单，但同样要拉起 k8s runner 容器
+    （见 `real_trading_preflight.preflight_check` 的依赖说明），属于实盘运维面。
+    """
+    return str(raw or "").strip().lower() not in _SIMULATION_TOKENS
+
+
+def ensure_real_trading_allowed(trading_mode: object) -> None:
+    """实盘关闭时，显式请求实盘侧模式的调用一律 403。
+
+    在 handler 里调（不是中间件）——模式在 query/body 里，中间件看不到。
+    调用点见 `real_trading_lifecycle.start_trading`、
+    `real_trading_preflight.{preflight_check,trading_precheck}`、
+    `manual_executions.{preview_manual_execution,create_manual_execution}`。
+    """
+    if is_real_trading_enabled() or not is_real_side_mode(trading_mode):
+        return
+    raise HTTPException(status_code=403, detail=DISABLED_DETAIL)
+
+
+def install_live_trading_gate_middleware(app: FastAPI, service_name: str) -> None:
+    """安装实盘闸门。`ENABLE_REAL_TRADING=false`（默认）时拒绝实盘专有端点。
+
+    拒绝用 403 而非 404：403 说得清「这东西存在但本部署没开」，
+    404 会让运维去查路由注册，方向反了。
+    """
+
+    @app.middleware("http")
+    async def _live_trading_gate(request: Request, call_next):
+        if is_real_trading_enabled():
+            return await call_next(request)
+
+        path = request.url.path
+        # 服务可能挂在 root_path 下（反代前缀），判定用去掉前缀后的路径
+        root_path = request.scope.get("root_path") or ""
+        if root_path and path.startswith(root_path):
+            path = path[len(root_path) :]
+
+        if not is_blocked(request.method, path):
+            return await call_next(request)
+
+        logger.warning(
+            "[LiveTradingGate] 拒绝 %s %s（%s=false，service=%s）",
+            request.method,
+            request.url.path,
+            ENV_KEY,
+            service_name,
+        )
+        return JSONResponse(
+            status_code=403,
+            content={
+                "detail": DISABLED_DETAIL,
+                "message": (
+                    f"本部署未启用实盘交易（{ENV_KEY}=false）。"
+                    "如需启用，请在后端与服务端同时设置该环境变量与前端构建变量 "
+                    "VITE_ENABLE_REAL_TRADING=true 后重启。"
+                ),
+                "success": False,
+                "error": {
+                    "code": DISABLED_DETAIL,
+                    "message": "real trading is disabled on this deployment",
+                },
+            },
+        )
