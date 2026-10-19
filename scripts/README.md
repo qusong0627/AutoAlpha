@@ -49,9 +49,9 @@ Run backend and data checks inside WSL:
 ```bash
 wsl bash /mnt/d/git/autoalpha/scripts/wsl/status.sh
 wsl bash /mnt/d/git/autoalpha/scripts/wsl/run-verify.sh
-wsl bash /mnt/d/git/autoalpha/scripts/wsl/db-smoke.sh
 wsl bash /mnt/d/git/autoalpha/scripts/wsl/pg-check.sh
 wsl bash /mnt/d/git/autoalpha/scripts/wsl/quantdb-check.sh
+wsl bash /mnt/d/git/autoalpha/scripts/wsl/task-lease-smoke.sh
 ```
 
 ## Script groups
@@ -59,9 +59,10 @@ wsl bash /mnt/d/git/autoalpha/scripts/wsl/quantdb-check.sh
 - `alpha_agent/`: paper-factor import, statistical/RD-Agent runners, naming, and
   factor pipeline utilities. Runner paths are referenced from repository root by
   algorithm manifests; do not move them without updating those manifests.
-- `wsl/`: PostgreSQL, Qlib cache, data mount, environment, diagnostics, and smoke
-  scripts. `probe-*` and `install-*` scripts are bring-up utilities; the start and
-  verification commands above are the supported deployment entrypoints.
+- `wsl/`: canonical runtime, database, cache, data-link, environment, and verification
+  scripts. Historical probes, old-auth smoke checks, task-specific monitors, obsolete
+  package installers, and the `/evolve`-creating legacy DB smoke are in `wsl/archive/`.
+  Use the start and verification commands above for routine operation.
 - `dev-web.cmd`: starts the slim frontend from `web/` using the checked-in lockfile
   and the configured npmmirror registry.
 - `verify-all.ps1`, `web-smoke.ps1`, `no-auth-smoke.ps1`: Windows-side deployment

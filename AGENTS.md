@@ -21,7 +21,7 @@ transcripts). Read it when something here is unclear.
 
 | Path | What it owns |
 |---|---|
-| `web/` | The only frontend. A **slim** Vite app: 155 files, 14 runtime deps. Load-bearing: `features/alpha-research` (mine/pool/backtest) + `features/factor-research` (research). The full upstream `electron/` (1343 files) was deleted on purpose. Only `src/workspace/*` is routed — see **Frontend visual design** for the two coexisting style systems. |
+| `web/` | The only frontend. A **slim** Vite app with 9 runtime dependencies. The full upstream `electron/` (1343 files) was deleted on purpose. Only `src/workspace/*` is routed; `tsc` follows `src/main.tsx`'s live import graph, while orphan source remains as reference — see **Frontend visual design** for the two coexisting style systems. |
 | `backend/services/engine/alpha_agent/` | Mining orchestration: `launcher.py`, `task_store.py`, two engines (`statistical/`, `rd_agent/`), `factorminer/`, `doc_*`, `experience_memory.py`. |
 | `backend/services/engine/app_factor_mining.py` | **The entrypoint.** Mounts only the mining routers. `engine/main.py` is upstream and is *not* what runs here. |
 | `backend/services/engine/factor_{backtest,report,research,library}/` | Downstream consumers. |
@@ -60,9 +60,9 @@ powershell -File D:\git\autoalpha\scripts\verify-all.ps1
 
 wsl bash /mnt/d/git/autoalpha/scripts/wsl/status.sh          # venv/PG/tables/service overview
 wsl bash /mnt/d/git/autoalpha/scripts/wsl/run-verify.sh      # route mounts (expect 9 groups / 111 routes)
-wsl bash /mnt/d/git/autoalpha/scripts/wsl/db-smoke.sh        # PG read/write + /evolve round-trip
 wsl bash /mnt/d/git/autoalpha/scripts/wsl/pg-check.sh        # tables + partial unique index
 wsl bash /mnt/d/git/autoalpha/scripts/wsl/quantdb-check.sh   # QuantDB actually readable
+wsl bash /mnt/d/git/autoalpha/scripts/wsl/task-lease-smoke.sh # disposable PG rows: lease takeover/fencing/recovery
 powershell -File D:\git\autoalpha\scripts\web-smoke.ps1      # frontend modules + /api proxy
 powershell -File D:\git\autoalpha\scripts\no-auth-smoke.ps1  # AUTH_DISABLED path
 ```
@@ -108,9 +108,11 @@ those files stay unimported. What shipped:
 * Backdrop is a six-stop pastel mesh on `.workspace-app`; glass = translucent white +
   `blur(12px)` + hairline + two-layer soft shadow.
 
-Tailwind is configured (`tailwind.config.cjs` + the postcss plugin) but the only `@tailwind`
-directives live in the unimported `global.css`, so **utility class names in JSX emit
-nothing** — style through `workspace.css`.
+Tailwind has been removed from the slim frontend dependency chain because its current v3
+build graph had unpatched npm advisories and the live app does not import any Tailwind
+directives. The legacy `@tailwind` directives remain only in the unimported `global.css`;
+**utility class names in JSX emit nothing** — style through `workspace.css`. Restoring the
+orphan page styles requires deliberately adding a reviewed Tailwind toolchain again.
 
 ### Tokens
 
@@ -168,9 +170,10 @@ Motion: `qa-fade-in-up/down/left/right` .6s · `qa-scale-in` .4s · `qa-float` 3
   in that one file — `lazy(() => import('./workspace/XPage'))`, a `<NavLink to="/x">` in the nav,
   and `<Route path="/x" element={<XPage />} />` in the `<Routes>`. Anything without a `<Route>`
   falls through the `path="*"` catch-all and redirects to `/`.
-* Reviving `pages/*` is three jobs, not a routing change: mount the route, import
-  `styles/global.css` **and** `features/alpha-research/styles-v2/index.css`, and wrap the mount
-  in `data-theme="alpha-research"` (the shadcn tokens there are scoped under it).
+* Reviving `pages/*` requires mounting the route, restoring a reviewed Tailwind/PostCSS
+  toolchain and any legacy package dependencies it imports, importing `styles/global.css`
+  **and** `features/alpha-research/styles-v2/index.css`, and wrapping the mount in
+  `data-theme="alpha-research"` (the shadcn tokens there are scoped under it).
 * `pages/MinePage.tsx` gets its glass and hover behaviour from `className="qa-glass"`, which
   lives in the orphan styles-v2 file — without it the page renders as bare inline styles.
 * Brand is **AutoAlpha** (renamed from `QuantaAlpha`). Do not reintroduce the old name in UI
@@ -267,7 +270,7 @@ These files intentionally differ from upstream. A blind re-sync from `next` will
 | `backend/services/engine/app_factor_mining.py` | New — the standalone entrypoint + auth bypass. |
 | `backend/services/engine/qlib_app/services/__init__.py` | Made lazy (PEP 562 `__getattr__`); upstream eagerly imports the whole backtest stack. |
 | `backend/services/api/routers/admin/__init__.py` | Emptied; upstream aggregates ~30 admin routers we do not ship. |
-| `web/**` | New slim app (own package.json / vite / tailwind / tsconfig). |
+| `web/**` | New slim app (own package.json / vite / tsconfig). |
 | `scripts/wsl/**`, `scripts/dev-web.cmd`, `scripts/web-smoke.ps1`, `scripts/no-auth-smoke.ps1`, `run-wsl.sh` | Ops scripts written for this deployment. |
 | `backend/shared/auth.py` | Added the retired dev internal secret to `_PUBLIC_INTERNAL_DEFAULTS` so any leftover copy fails closed. |
 | `backend/services/api/routers/admin/alpha_factor_pipeline.py` | `promote*` heavy compute moved off the event loop (thread pool + timeout + concurrency cap); qlib `kernels` capped. |
@@ -277,14 +280,16 @@ These files intentionally differ from upstream. A blind re-sync from `next` will
 
 Everything else under `backend/`, `config/`, `docs/`, `alphaagent/`, `requirements/`, and
 `scripts/` was *intended* to be a byte-identical upstream copy, but that assumption is false.
-The 2026-10-18 blob comparison in `MIRROR_DIFFS.md` found **74 byte-different common files**
-(23 differ only in CRLF/LF line endings; 51 still differ after newline normalization) and
-**72 mirror-only files**; 1,797 upstream files in the compared scope are intentionally omitted
+The 2026-10-19 blob comparison in `MIRROR_DIFFS.md` found **80 byte-different common files**
+(22 differ only in CRLF/LF line endings; 58 still differ after newline normalization) and
+**88 mirror-only files**; 1,797 upstream files in the compared scope are intentionally omitted
 from this slim slice. The inventory excludes the purpose-built `web/` tree and generated files.
-Do **not** blind-re-sync from `next`: the difference list still needs intent-by-intent review.
+Do **not** blind-re-sync from `next`: each content difference must remain understood before any sync.
 See `PRELAUNCH_REVIEW.md` (P1-14) and `MIRROR_DIFFS.md`.
-`scripts/wsl/probe-*.sh` / `install-*.sh` are one-off diagnostics from bring-up; the canonical
-entrypoints are the ones listed under "Run it" and "Verification".
+Historical probes, old-auth smoke checks, task-specific monitors, package installers,
+and the legacy `/evolve` database smoke live in `scripts/wsl/archive/`. They are not
+routine entrypoints; `db-smoke.sh` creates a real mining task. The canonical entrypoints
+are listed under "Run it" and "Verification".
 
 ## Known gaps
 
