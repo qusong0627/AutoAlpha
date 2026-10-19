@@ -27,15 +27,31 @@ import asyncio
 import ipaddress
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+)
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend.shared.secret_redaction import install_secret_redaction, redact_data
+from backend.shared.request_id import install_request_id_middleware
+from backend.shared.request_logging import install_access_log_middleware
+from backend.shared.service_health_metrics import (
+    set_service_health,
+)
 
 logging.basicConfig(level=logging.INFO)
 install_secret_redaction()
@@ -227,6 +243,50 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+install_request_id_middleware(app)
+install_access_log_middleware(app, service_name="factor-mining-standalone")
+
+# Serve the built workspace from the same origin when a frontend build is present.
+# This keeps API/health paths identical in dev and production without requiring a
+# Vite server in production. AUTOALPHA_WEB_DIST can point at an external build dir.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_WEB_DIST = Path(
+    os.getenv("AUTOALPHA_WEB_DIST", str(_REPO_ROOT / "web" / "dist"))
+).expanduser().resolve()
+_WEB_INDEX = _WEB_DIST / "index.html"
+if _WEB_INDEX.is_file() and (_WEB_DIST / "assets").is_dir():
+    app.mount(
+        "/assets",
+        StaticFiles(directory=str(_WEB_DIST / "assets"), check_dir=True),
+        name="web-assets",
+    )
+    logger.info("serving built workspace from %s", _WEB_DIST)
+else:
+    logger.info("built workspace not found at %s; API-only mode", _WEB_DIST)
+
+_METRICS_REGISTRY = CollectorRegistry()
+HTTP_REQUESTS = Counter(
+    "autoalpha_http_requests_total",
+    "HTTP requests handled by the AutoAlpha factor-mining service",
+    ("method", "route", "status"),
+    registry=_METRICS_REGISTRY,
+)
+HTTP_REQUEST_DURATION = Histogram(
+    "autoalpha_http_request_duration_seconds",
+    "HTTP request duration in seconds",
+    ("method", "route"),
+    registry=_METRICS_REGISTRY,
+)
+SERVICE_HEALTH = Gauge(
+    "autoalpha_service_health_status",
+    "Factor-mining service health status (1 healthy, 0 unhealthy)",
+    ("service",),
+    registry=_METRICS_REGISTRY,
+)
+_METRIC_HTTP_METHODS = frozenset(
+    {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"}
+)
+
 
 @app.exception_handler(StarletteHTTPException)
 async def _redact_http_exception(
@@ -317,8 +377,14 @@ def _is_loopback_host(value: str | None) -> bool:
     if not value or value != value.strip() or any(char in value for char in "/\\@#?"):
         return False
     try:
-        host = urlsplit(f"//{value}").hostname
+        authority = urlsplit(f"//{value}")
+        host = authority.hostname
+        port = authority.port  # accessing this also rejects malformed/out-of-range ports
     except ValueError:
+        return False
+    if authority.netloc.endswith(":") or (
+        port is not None and not 1 <= port <= 65535
+    ):
         return False
     if not host:
         return False
@@ -331,13 +397,35 @@ def _is_loopback_host(value: str | None) -> bool:
         return False
 
 
+def _is_loopback_client(request: Request) -> bool:
+    """Require a numeric loopback peer; Host headers are client-controlled."""
+    client = request.client
+    if client is None:
+        return False
+    try:
+        address = ipaddress.ip_address(client.host)
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        return address.ipv4_mapped.is_loopback
+    return address.is_loopback
+
+
 def _allowed_local_origins() -> set[str]:
     """Return explicitly configured loopback origins, never a wildcard."""
     from backend.shared.cors import DEFAULT_DEV_ORIGINS, resolve_cors_origins
 
-    configured = resolve_cors_origins(logger=logger)
+    # Vite preview uses 4173 by default and shares the local API proxy.
+    local_defaults = [
+        *DEFAULT_DEV_ORIGINS,
+        "http://127.0.0.1:4173",
+        "http://localhost:4173",
+    ]
+    configured = resolve_cors_origins(
+        logger=logger, default_dev_origins=local_defaults
+    )
     if "*" in configured:
-        configured = DEFAULT_DEV_ORIGINS
+        configured = local_defaults
     return {
         origin.rstrip("/")
         for origin in configured
@@ -373,14 +461,23 @@ def _install_auth_bypass() -> None:
             "AUTH_DISABLED=1 → 鉴权已关闭（含 admin 层），身份固定为 user_id=%s",
             dev()["user_id"],
         )
-    except Exception as e:  # noqa: BLE001 - 覆盖失败不阻断启动，只提示
-        logger.error("AUTH_DISABLED 覆盖鉴权依赖失败: %r", e)
+    except Exception as exc:
+        # AUTH_DISABLED is a deployment-wide access decision. Starting with only
+        # the HTTP middleware bypass installed would leave admin dependencies
+        # protected (or inconsistently protected) while health reports no-auth.
+        # Fail startup so the configured security model is never partially active.
+        raise RuntimeError(
+            "AUTH_DISABLED could not install all authentication dependency overrides"
+        ) from exc
 
 
 _runtime_environment = os.getenv("ENVIRONMENT", "development").strip().lower()
-if _env_flag("AUTH_DISABLED") and _runtime_environment in {"production", "staging"}:
+_NO_AUTH_ENVIRONMENTS = frozenset(
+    {"development", "dev", "local", "test", "testing"}
+)
+if _env_flag("AUTH_DISABLED") and _runtime_environment not in _NO_AUTH_ENVIRONMENTS:
     raise RuntimeError(
-        "AUTH_DISABLED is forbidden when ENVIRONMENT is production or staging"
+        "AUTH_DISABLED is allowed only in a local development or test environment"
     )
 
 if _env_flag("AUTH_DISABLED"):
@@ -396,10 +493,14 @@ async def auth_middleware(request: Request, call_next):
     # 独立部署定位：只有本机上的因子挖掘前端在访问，不接用户体系。
     # 直接注入一个管理员身份并放行；生产另起网关时不要开这个开关。
     if _env_flag("AUTH_DISABLED"):
-        # No-auth mode grants every request the development admin identity. Reject
-        # non-loopback Host values to prevent browser DNS-rebinding access, and
-        # reject cross-site/opaque origins on state-changing requests. This is a
-        # browser boundary only; it does not authenticate local processes.
+        # No-auth mode grants every request the development admin identity. Require
+        # both a loopback TCP peer and a loopback Host (Host alone is spoofable),
+        # then reject cross-site/opaque origins on state-changing requests.
+        if not _is_loopback_client(request):
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={"detail": "免登录模式仅接受本机连接"},
+            )
         if not _is_loopback_host(request.headers.get("host")):
             return JSONResponse(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -450,6 +551,17 @@ async def auth_middleware(request: Request, call_next):
         except Exception:  # noqa: BLE001 - 交由下游决定
             pass
 
+    if (
+        method != "OPTIONS"
+        and path == "/metrics"
+        and not is_internal_call
+        and not user_id
+    ):
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"detail": "Authentication required to read metrics"},
+        )
+
     if method != "OPTIONS" and path.startswith("/api/v1/"):
         if not is_internal_call and not user_id:
             return JSONResponse(
@@ -484,12 +596,54 @@ async def auth_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+@app.middleware("http")
+async def request_metrics_middleware(request: Request, call_next):
+    """Record low-cardinality route metrics without exposing raw URL values."""
+    if request.url.path == "/metrics":
+        return await call_next(request)
+
+    started = time.perf_counter()
+    response_status = 500
+    try:
+        response = await call_next(request)
+        response_status = response.status_code
+        return response
+    finally:
+        route = request.scope.get("route")
+        route_template = getattr(route, "path", "unmatched")
+        if not isinstance(route_template, str):
+            route_template = "unmatched"
+        method = request.method.upper()
+        method_label = method if method in _METRIC_HTTP_METHODS else "OTHER"
+        status_label = (
+            f"{response_status // 100}xx"
+            if 100 <= response_status < 600
+            else "other"
+        )
+        HTTP_REQUESTS.labels(
+            method=method_label,
+            route=route_template,
+            status=status_label,
+        ).inc()
+        HTTP_REQUEST_DURATION.labels(
+            method=method_label,
+            route=route_template,
+        ).observe(time.perf_counter() - started)
+
+
 try:
     from backend.shared.cors import resolve_cors_origins
 
+    # No-auth grants a shared admin identity. Never pair it with wildcard CORS:
+    # a hostile website could read localhost API responses even if writes check Origin.
+    cors_origins = (
+        sorted(_allowed_local_origins())
+        if _env_flag("AUTH_DISABLED")
+        else resolve_cors_origins(logger=logger)
+    )
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=resolve_cors_origins(logger=logger),
+        allow_origins=cors_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -526,6 +680,10 @@ async def health():
         str(_STARTUP.get(name, "")).startswith("ok") for name in critical_startup
     )
     healthy = mount_ok and database_status == "ok" and startup_ok
+    SERVICE_HEALTH.labels(service="factor-mining-standalone").set(
+        1 if healthy else 0
+    )
+    set_service_health("factor-mining-standalone", healthy)
     return {
         "status": "healthy" if healthy else "degraded",
         "service": "factor-mining-standalone",
@@ -542,13 +700,47 @@ async def health():
     }
 
 
+@app.get("/metrics", include_in_schema=False)
+async def metrics():
+    """Expose Prometheus metrics; auth middleware protects non-local deployments."""
+    return Response(
+        content=generate_latest(_METRICS_REGISTRY),
+        media_type=CONTENT_TYPE_LATEST,
+    )
+
+
 @app.get("/")
 async def root():
+    if _WEB_INDEX.is_file() and (_WEB_DIST / "assets").is_dir():
+        return FileResponse(_WEB_INDEX)
     return {
         "message": "Factor Mining Standalone is running",
         "mounted": _MOUNTED,
         "failed": redact_data(_FAILED),
     }
+
+
+@app.get("/{frontend_path:path}", include_in_schema=False)
+async def serve_workspace_route(frontend_path: str):
+    """Serve the SPA for browser routes, while keeping unknown API paths as 404s."""
+    if not _WEB_INDEX.is_file() or not (_WEB_DIST / "assets").is_dir():
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    # Never turn API, websocket, docs, or metrics typos into a successful HTML page.
+    if frontend_path == "api" or frontend_path.startswith(("api/", "ws/")):
+        raise HTTPException(status_code=404, detail="Not Found")
+    if frontend_path in {"docs", "redoc", "openapi.json", "health", "metrics"}:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    candidate = (_WEB_DIST / frontend_path).resolve()
+    try:
+        candidate.relative_to(_WEB_DIST)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Not Found") from None
+
+    if candidate.is_file():
+        return FileResponse(candidate)
+    return FileResponse(_WEB_INDEX)
 
 
 if __name__ == "__main__":

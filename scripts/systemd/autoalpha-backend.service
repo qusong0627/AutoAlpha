@@ -12,7 +12,7 @@ User=qusong
 Group=qusong
 Environment=HOME=/home/qusong
 Environment=VENV=/home/qusong/autoalpha-venv312
-Environment=HOST=0.0.0.0
+Environment=HOST=127.0.0.1
 Environment=PORT=8001
 Environment=QM_RUNTIME_ENV_FILE=/home/qusong/.config/autoalpha/runtime.env
 Environment=AUTH_DISABLED=1

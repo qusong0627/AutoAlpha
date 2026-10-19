@@ -45,7 +45,9 @@ user-agents>=2.2.0
 
 # ── 文档挖掘链（T-FM-07，ENABLE_DOC_MINING=true 时才走）──
 psutil>=5.9.0
-Pillow>=10.0.0
+Pillow>=10.0.0,<13.0.0  # 与共享环境中的 Streamlit 兼容
+websockets<17.0.0      # 与共享环境中的 Prefect / LangGraph SDK 兼容
+importlib-metadata<9.0.0  # 与共享环境中的 LiteLLM 兼容
 pypdf>=4.0.0
 
 # ── 可选：投研/训练聚合层（research.py、research_service.py 的运行期依赖）──
