@@ -21,8 +21,16 @@ done
 
 if [ "${1:-}" = "--apply" ]; then
   mkdir -p /data/qlib/cn_data /data/quantcustom/6_ml_datasets /data/alpha_agent_logs /data/rd_agent_kb /data/reports
-  chown -R "$OWNER" "${TARGETS[@]}"
-  chmod 755 /data
+  for path in "${TARGETS[@]}"; do
+    resolved=$(realpath -m -- "$path")
+    case "$resolved" in
+      /data/*) ;;
+      *) echo "FATAL: 递归目标逃逸 /data：$path -> $resolved" >&2; exit 1 ;;
+    esac
+  done
+  chown -R --no-dereference "$OWNER" "${TARGETS[@]}"
+  # Permit traversal to known child paths without exposing the /data listing.
+  chmod 711 /data
   chmod 750 /data/qlib /data/qlib/cn_data /data/quantcustom /data/reports
   chmod 700 /data/alpha_agent_logs /data/rd_agent_kb
 elif [ "$#" -eq 0 ]; then

@@ -26,15 +26,17 @@ fi
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/load-runtime-env.sh" || exit 1
-
-APP_HOST=${PGHOST:-${DB_HOST:-127.0.0.1}}
-APP_PORT=${PGPORT:-${DB_PORT:-5432}}
-APP_USER=${PGUSER_APP:-${DB_USER:-quantmind}}
-APP_PASS=${PGPASS_APP:-${DB_PASSWORD:-}}
-RESTORE_DB=${AUTOALPHA_RESTORE_DB:-}
-if [ -z "$APP_PASS" ] && [ -n "${DATABASE_URL:-}" ]; then
-  APP_PASS=$(python3 -c 'import os, urllib.parse; print(urllib.parse.unquote(urllib.parse.urlsplit(os.environ["DATABASE_URL"]).password or ""))')
+. "$SCRIPT_DIR/pg-url-env.sh"
+if [ -n "${DATABASE_URL:-}" ]; then
+  resolve_pg_url_env || exit 1
+  apply_pg_url_options
 fi
+
+APP_HOST=${PGHOST:-${PG_URL_HOST:-${DB_HOST:-127.0.0.1}}}
+APP_PORT=${PGPORT:-${PG_URL_PORT:-${DB_PORT:-5432}}}
+APP_USER=${PGUSER_APP:-${PG_URL_USER:-${DB_USER:-quantmind}}}
+APP_PASS=${PGPASS_APP:-${PG_URL_PASSWORD:-${DB_PASSWORD:-}}}
+RESTORE_DB=${AUTOALPHA_RESTORE_DB:-}
 if [ -z "$APP_PASS" ]; then
   echo "FATAL: 请在受保护的 runtime.env 中设置 DB_PASSWORD 或 DATABASE_URL。" >&2
   exit 1
@@ -44,8 +46,9 @@ if [[ ! "$RESTORE_DB" =~ ^autoalpha_restore_[a-zA-Z0-9_]+$ ]]; then
   exit 1
 fi
 
+unset DATABASE_URL DB_PASSWORD
 export PGPASSWORD="$APP_PASS"
-unset APP_PASS
+unset APP_PASS PG_URL_PASSWORD
 PG_ARGS=(--host "$APP_HOST" --port "$APP_PORT" --username "$APP_USER" --no-password)
 EXISTS=$(psql "${PG_ARGS[@]}" --dbname postgres --no-psqlrc --tuples-only --no-align \
   --command "SELECT 1 FROM pg_database WHERE datname = '$RESTORE_DB'")

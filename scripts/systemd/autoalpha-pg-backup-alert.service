@@ -1,0 +1,6 @@
+[Unit]
+Description=Record AutoAlpha PostgreSQL backup failure
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/logger -p daemon.crit -t autoalpha-pg-backup "PostgreSQL backup failed; inspect autoalpha-pg-backup.service and the backup target ACL."

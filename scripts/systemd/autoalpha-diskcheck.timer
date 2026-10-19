@@ -1,0 +1,11 @@
+[Unit]
+Description=Check host disk space for the AutoAlpha WSL distro every six hours
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=6h
+AccuracySec=5min
+Unit=autoalpha-diskcheck.service
+
+[Install]
+WantedBy=timers.target

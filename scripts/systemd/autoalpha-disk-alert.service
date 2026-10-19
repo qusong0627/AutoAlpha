@@ -1,0 +1,11 @@
+[Unit]
+Description=Record AutoAlpha host-disk threshold failure in the system journal
+StartLimitIntervalSec=3600
+StartLimitBurst=1
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/logger -p daemon.crit -t autoalpha-disk "Windows host volume free space is below threshold; inspect autoalpha-diskcheck.service"
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full

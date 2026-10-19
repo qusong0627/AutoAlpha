@@ -15,25 +15,53 @@ DST=/data/quantdb
 
 echo "== 源目录检查 =="
 [ -d "$SRC" ] || { echo "  源不存在: $SRC"; exit 1; }
+[ ! -L "$SRC" ] || { echo "FATAL: QuantDB 源目录不能是符号链接: $SRC" >&2; exit 1; }
+mount_target=$(findmnt -n -o TARGET -T "$SRC" 2>/dev/null || true)
+[ "$mount_target" = "/mnt/e" ] || {
+  echo "FATAL: $SRC 没有落在预期的 E: 挂载点 /mnt/e（实际挂载点: ${mount_target:-未知}）" >&2
+  exit 1
+}
 echo "  $SRC  ok"
 
 echo
 echo "== 建 /data 布局 =="
-mkdir -p /data
+ensure_real_dir() {
+  local path=$1
+  if [ -L "$path" ]; then
+    echo "FATAL: 写入目录不能是符号链接: $path -> $(readlink "$path")" >&2
+    exit 1
+  fi
+  mkdir -p -- "$path"
+  [ -d "$path" ] && [ ! -L "$path" ] || {
+    echo "FATAL: 预期真实目录: $path" >&2
+    exit 1
+  }
+}
+
+ensure_real_dir /data
 
 if [ -L "$DST" ]; then
-  echo "  $DST 已是软链 -> $(readlink "$DST")，重建"
-  rm -f "$DST"
-elif [ -d "$DST" ]; then
-  echo "  $DST 已是实体目录，跳过（不覆盖已有数据）"
+  current_target=$(readlink -e -- "$DST" 2>/dev/null || true)
+  expected_target=$(realpath -e -- "$SRC")
+  [ "$current_target" = "$expected_target" ] || {
+    echo "FATAL: $DST 指向非预期目标 ($(readlink "$DST")); 预期 $SRC。未修改现有链接。" >&2
+    exit 1
+  }
+  echo "  $DST 已正确链接 -> $current_target"
+elif [ -e "$DST" ]; then
+  echo "FATAL: $DST 已被非链接文件或目录占用；请先检查其内容，未覆盖。" >&2
+  exit 1
+else
+  ln -s -- "$SRC" "$DST"
 fi
-[ -e "$DST" ] || ln -s "$SRC" "$DST"
 
 # 写侧根与日志根放 WSL 本地 ext4：物化器每因子要重写 1600+ 分区，
 # 走 9p 会明显拖慢；如需落在 Windows 盘可自行改成软链。
-mkdir -p /data/quantcustom/6_ml_datasets
-mkdir -p /data/qlib/cn_data
-mkdir -p /data/alpha_agent_logs
+ensure_real_dir /data/quantcustom
+ensure_real_dir /data/quantcustom/6_ml_datasets
+ensure_real_dir /data/qlib
+ensure_real_dir /data/qlib/cn_data
+ensure_real_dir /data/alpha_agent_logs
 
 echo
 echo "== 结果 =="
