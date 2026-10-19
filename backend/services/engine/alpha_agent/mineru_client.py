@@ -226,19 +226,15 @@ def is_local_mode() -> bool:
 
 
 def mineru_unconfigured_message() -> str:
-    """通道未配置 → 指路「因子挖掘 → 文档解析设置」+ env 兜底（服务层与端点共用）。
-
-    2026-10-09 起用户级配置入口在因子挖掘内（``doc_mining_settings``），
-    不再提用户中心；文案同时保留部署级 env 兜底，两种配法都告诉用户。
-    """
+    """通道未配置时，指引部署者在受保护的运行环境中配置凭证。"""
     if is_local_mode():
         return (
-            "本地 MinerU 服务未配置，文档解析不可用：请在「因子挖掘 → 文档解析设置」"
-            "填写本地/局域网 MinerU 服务地址，或在服务器 .env 配置 MINERU_LOCAL_URL"
+            "本地 MinerU 服务未配置，文档解析不可用：请在受保护的部署环境中配置 "
+            "MINERU_LOCAL_URL，并按需配置 MINERU_LOCAL_API_KEY，然后重启后端"
         )
     return (
-        "MinerU 解析通道未配置，文档解析不可用：请在「因子挖掘 → 文档解析设置」"
-        "填写 MinerU API Token，或在服务器 .env 配置 MINERU_API_TOKEN"
+        "MinerU 解析通道未配置，文档解析不可用：请在受保护的部署环境中配置 "
+        "MINERU_API_TOKEN，然后重启后端"
     )
 
 

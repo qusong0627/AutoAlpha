@@ -21,41 +21,22 @@ import type {
   PaginatedResponse,
 } from '../types';
 
-/** 密钥字段名（api_key / qwen_api_key / embedding_api_key / token / password …） */
-const SECRET_FIELD_PATTERN = /(^|_)(api_?key|password|secret|token)$/i;
-
 /**
- * 日志脱敏：递归把密钥字段替换成 `***`。
- *
- * 保存 LLM 配置的请求体里必然带 `qwen_api_key` 明文，直接 console.log
- * 等于把密钥写进开发者工具、Electron 日志以及任何一张截图里。
- */
-function redactSecrets(value: unknown): unknown {
-  if (value === null || typeof value !== 'object') return value;
-  if (Array.isArray(value)) return value.map(redactSecrets);
-  return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>).map(([k, v]) => [
-      k,
-      SECRET_FIELD_PATTERN.test(k) ? '***' : redactSecrets(v),
-    ])
-  );
-}
-
-/**
- * 错误摘要：只取「方法 + URL + 状态码 + 消息」。
+ * 错误摘要：只取「方法 + 状态码 + 错误码」。
  *
  * 不能直接打印 axios error —— 它挂着 `error.config`，里面含
  * `Authorization: Bearer <token>` 与整个请求体，日志里就是明文凭证。
  */
 function describeRequestError(error: unknown): string {
   const e = error as {
-    config?: { method?: string; url?: string };
+    config?: { method?: string };
     response?: { status?: number };
-    message?: string;
+    code?: string;
   };
-  const where = [e?.config?.method?.toUpperCase(), e?.config?.url].filter(Boolean).join(' ');
+  const method = e?.config?.method?.toUpperCase() || 'request';
   const status = e?.response?.status ? ` (HTTP ${e.response.status})` : '';
-  return `${where || 'request'} failed${status}: ${e?.message ?? String(error)}`;
+  const code = e?.code ? ` [${e.code}]` : '';
+  return `${method} failed${status}${code}`;
 }
 
 /**
@@ -98,10 +79,7 @@ class BaseApiClient {
         // 添加请求ID用于追踪
         config.headers['X-Request-ID'] = this.generateRequestId();
 
-        console.log(
-          `[API Request] ${config.method?.toUpperCase()} ${config.url}`,
-          redactSecrets(config.data)
-        );
+        console.log(`[API Request] ${config.method?.toUpperCase()}`);
         return config;
       },
       (error) => {
@@ -113,7 +91,7 @@ class BaseApiClient {
     // 响应拦截器
     this.axiosInstance.interceptors.response.use(
       (response: AxiosResponse) => {
-        console.log(`[API Response] ${response.config.url}`, redactSecrets(response.data));
+        console.log('[API Response]', response.status);
         const data = response.data as any;
         if (data && typeof data === 'object' && 'code' in data && 'data' in data) {
           response.data = data.data;
@@ -819,47 +797,8 @@ export class UserCenterService extends BaseApiClient {
   }
 
 
-  // ============ LLM API Key 管理 ============
-
-  /**
-   * 获取 LLM 配置状态（chat 通道）
-   *
-   * 不含 embedding 段：向量检索配置已随 UI 迁到因子挖掘
-   * （`GET /alpha-agent/llm-config` 的 `embedding` 段 +
-   * `PUT /alpha-agent/llm-config/embedding`），这里只服务「AI 服务配置」。
-   */
-  async getLLMConfig(): Promise<{
-    has_key: boolean;
-    masked_key: string;
-    model: string;
-    base_url: string;
-    provider: string;
-    extra_headers: string;
-  }> {
-    const response = await this.get<any>('/ai-ide/config/llm');
-    return {
-      has_key: response?.has_key || false,
-      masked_key: response?.masked_key || '',
-      model: response?.model || '',
-      base_url: response?.base_url || '',
-      provider: response?.provider || '',
-      extra_headers: response?.extra_headers || '',
-    };
-  }
-
-  /**
-   * 保存 LLM 配置 (API Key + Model + Base URL + 自定义请求头)
-   */
-  async saveLLMConfig(apiKey: string, model?: string, baseUrl?: string, provider?: string, extraHeaders?: string): Promise<{ success: boolean; message?: string }> {
-    return this.post('/ai-ide/config/llm', { qwen_api_key: apiKey, model, base_url: baseUrl, provider, extra_headers: extraHeaders });
-  }
-
-  /**
-   * 测试 LLM 配置连通性（后端不落库，直接用传入的 Key/模型/地址发请求）
-   */
-  async testLLMConfig(apiKey: string, model?: string, baseUrl?: string, extraHeaders?: string): Promise<{ success: boolean; message?: string; status_code?: number }> {
-    return this.post('/ai-ide/config/llm/test', { qwen_api_key: apiKey, model, base_url: baseUrl, extra_headers: extraHeaders });
-  }
+  // LLM credentials are deployment-level secrets; this user-scoped client has no
+  // read, write, or test methods for API keys. Configure them in protected env.
 
   // ============ 手机号管理 ============
 

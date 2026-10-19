@@ -216,7 +216,11 @@ export class ErrorHandler {
 
     // 记录到控制台（开发环境）
     if (process.env.NODE_ENV === 'development') {
-      console.error('🚨 Auth Error:', standardError);
+      console.error('Auth request failed', {
+        type: standardError.type,
+        code: standardError.code,
+        timestamp: standardError.timestamp,
+      });
     }
 
     return standardError;

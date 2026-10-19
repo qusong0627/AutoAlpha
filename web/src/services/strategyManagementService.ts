@@ -14,6 +14,23 @@ import {
 } from '../types/backtest/strategy';
 import { isMinibtStrategyCode } from '../utils/minibt';
 
+function summarizeRequestError(error: unknown): {
+  method?: string;
+  status?: number;
+  code?: string;
+} {
+  const value = error as {
+    config?: { method?: string };
+    response?: { status?: number };
+    code?: string;
+  };
+  return {
+    method: value?.config?.method?.toUpperCase(),
+    status: value?.response?.status,
+    code: value?.code,
+  };
+}
+
 class StrategyManagementService {
   private client: AxiosInstance;
 
@@ -131,7 +148,7 @@ class StrategyManagementService {
           : ['使用"策略转换"功能将Python代码转换为Qlib格式'],
       };
     } catch (error: any) {
-      console.error('[StrategyManagementService] Validation error:', error);
+      console.error('[StrategyManagementService] Validation error:', summarizeRequestError(error));
       return {
         is_valid: false,
         is_qlib_format: false,
@@ -190,7 +207,7 @@ class StrategyManagementService {
         ],
       };
     } catch (error: any) {
-      console.error('[StrategyManagementService] Conversion error:', error);
+      console.error('[StrategyManagementService] Conversion error:', summarizeRequestError(error));
       return {
         success: false,
         errors: [error.message || '转换失败'],
@@ -206,7 +223,7 @@ class StrategyManagementService {
       const response = await this.client.post('/api/v1/strategy/extract-config', { code });
       return this.unwrapResponse<any>(response.data);
     } catch (error: any) {
-      console.error('[StrategyManagementService] Extract error:', error);
+      console.error('[StrategyManagementService] Extract error:', summarizeRequestError(error));
       throw new Error(error.response?.data?.detail || error.message || '提取配置失败，请检查代码规范');
     }
   }
@@ -241,7 +258,7 @@ class StrategyManagementService {
         cos_url: created?.cos_url || undefined,  // 透传 COS URL
       };
     } catch (error: any) {
-      console.error('[StrategyManagementService] Save error:', error);
+      console.error('[StrategyManagementService] Save error:', summarizeRequestError(error));
       throw new Error(error.response?.data?.detail || error.message || '保存策略失败');
     }
   }
@@ -266,7 +283,7 @@ class StrategyManagementService {
             : [];
       return items.map((item: any) => this.toStrategyFile(item));
     } catch (error: any) {
-      console.error('[StrategyManagementService] Load error:', error);
+      console.error('[StrategyManagementService] Load error:', summarizeRequestError(error));
       throw new Error(error.message || '加载策略失败');
     }
   }
@@ -294,7 +311,7 @@ class StrategyManagementService {
       if (!data) throw new Error('策略详情不存在');
       return this.toStrategyFile(data);
     } catch (error: any) {
-      console.error('[StrategyManagementService] Get detail error:', error);
+      console.error('[StrategyManagementService] Get detail error:', summarizeRequestError(error));
       throw new Error(error.message || '获取策略详情失败');
     }
   }
@@ -319,7 +336,7 @@ class StrategyManagementService {
       const updated = this.unwrapResponse<any>(response.data);
       return this.toStrategyFile(updated);
     } catch (error: any) {
-      console.error('[StrategyManagementService] Update error:', error);
+      console.error('[StrategyManagementService] Update error:', summarizeRequestError(error));
       throw new Error(error.response?.data?.detail || error.message || '更新策略失败');
     }
   }
@@ -331,7 +348,7 @@ class StrategyManagementService {
     try {
       await this.client.delete(`/api/v1/strategies/${strategyId}`);
     } catch (error: any) {
-      console.error('[StrategyManagementService] Delete error:', error);
+      console.error('[StrategyManagementService] Delete error:', summarizeRequestError(error));
       throw new Error(error.message || '删除策略失败');
     }
   }
@@ -344,7 +361,7 @@ class StrategyManagementService {
       const response = await this.client.post('/api/v1/strategies/sync');
       return this.unwrapResponse<any>(response.data);
     } catch (error: any) {
-      console.error('[StrategyManagementService] Sync templates error:', error);
+      console.error('[StrategyManagementService] Sync templates error:', summarizeRequestError(error));
       throw new Error(error.response?.data?.detail || error.message || '同步模板失败');
     }
   }
@@ -357,7 +374,7 @@ class StrategyManagementService {
       const response = await this.client.post(`/api/v1/strategies/${strategyId}/activate`);
       return this.unwrapResponse<any>(response.data);
     } catch (error: any) {
-      console.error('[StrategyManagementService] Activate error:', error);
+      console.error('[StrategyManagementService] Activate error:', summarizeRequestError(error));
       throw new Error(error.response?.data?.detail || error.message || '激活策略失败');
     }
   }
@@ -370,7 +387,7 @@ class StrategyManagementService {
       const response = await this.client.delete(`/api/v1/strategies/${strategyId}/activate`);
       return this.unwrapResponse<any>(response.data);
     } catch (error: any) {
-      console.error('[StrategyManagementService] Deactivate error:', error);
+      console.error('[StrategyManagementService] Deactivate error:', summarizeRequestError(error));
       throw new Error(error.response?.data?.detail || error.message || '停用策略失败');
     }
   }

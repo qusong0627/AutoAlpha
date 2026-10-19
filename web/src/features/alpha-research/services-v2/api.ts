@@ -1434,8 +1434,8 @@ export async function listFactorBacktests(
 // ========================== LLM Config ==========================
 
 /**
- * 向量检索（embedding）通道状态。与 chat **互相独立**：它只反映用户自己填的值，
- * 为空表示沿用容器级 `EMBEDDING_*`，不跟随 chat 的 env 兜底。
+ * 向量检索（embedding）通道状态。与 chat **互相独立**：只反映服务端
+ * `EMBEDDING_*` 环境变量配置，不包含用户级凭证。
  * 唯一的运行时消费者是因子挖掘（RD-Agent 子进程的记忆检索）。
  */
 export interface EmbeddingConfigStatus {

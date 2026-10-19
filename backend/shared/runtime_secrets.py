@@ -32,14 +32,35 @@ def runtime_env_path() -> Path:
 
 def _read_secure_text(path: Path) -> str | None:
     try:
-        if path.is_symlink() or path.parent.is_symlink():
-            raise PermissionError(f"runtime env 文件及其目录不能是符号链接: {path}")
+        if path.is_symlink():
+            raise PermissionError(f"runtime env 文件不能是符号链接: {path}")
         if os.name == "posix":
-            parent = path.parent.stat()
-            if parent.st_uid != os.getuid() or parent.st_mode & 0o022:
-                raise PermissionError(
-                    f"runtime env 目录必须由当前用户拥有且不可被组/其他用户写入: {path.parent}"
-                )
+            uid = os.getuid()
+            directory = path.parent
+            is_immediate_parent = True
+            while True:
+                metadata = directory.lstat()
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise PermissionError(
+                        f"runtime env 路径祖先必须是普通目录: {directory}"
+                    )
+                if metadata.st_mode & 0o022:
+                    raise PermissionError(
+                        f"runtime env 路径祖先不可被组/其他用户写入: {directory}"
+                    )
+                if is_immediate_parent:
+                    if metadata.st_uid != uid:
+                        raise PermissionError(
+                            f"runtime env 直接父目录必须由当前用户拥有: {directory}"
+                        )
+                elif metadata.st_uid not in {uid, 0}:
+                    raise PermissionError(
+                        f"runtime env 路径祖先必须由当前用户或 root 拥有: {directory}"
+                    )
+                if directory.parent == directory:
+                    break
+                directory = directory.parent
+                is_immediate_parent = False
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
         fd = os.open(path, flags)
     except FileNotFoundError:
@@ -58,6 +79,12 @@ def _read_secure_text(path: Path) -> str | None:
                 raise PermissionError(
                     f"runtime env 必须由当前用户拥有且权限为 0600 或更严格: {path}"
                 )
+            path_metadata = os.stat(path, follow_symlinks=False)
+            if (path_metadata.st_dev, path_metadata.st_ino) != (
+                metadata.st_dev,
+                metadata.st_ino,
+            ):
+                raise PermissionError(f"runtime env 文件在打开期间发生变化: {path}")
         with os.fdopen(fd, "r", encoding="utf-8") as stream:
             fd = -1
             content = stream.read()
@@ -105,6 +132,54 @@ def _parse(path: Path) -> dict[str, str]:
     return out
 
 
+def _ensure_runtime_env_parent(directory: Path) -> None:
+    """Create a private runtime-env directory without accepting symlink ancestors."""
+    directory = Path(os.path.abspath(directory))
+    chain: list[Path] = []
+    current = directory
+    while True:
+        chain.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+
+    uid = os.getuid() if os.name == "posix" else None
+
+    def validate(candidate: Path, *, immediate: bool) -> bool:
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise PermissionError(
+                f"runtime env 路径祖先必须是普通目录: {candidate}"
+            )
+        if os.name == "posix":
+            allowed_owners = {uid} if immediate else {uid, 0}
+            if metadata.st_uid not in allowed_owners or metadata.st_mode & 0o022:
+                raise PermissionError(
+                    f"runtime env 目录属主或权限不安全: {candidate}"
+                )
+        return True
+
+    # Validate existing ancestors before mkdir can traverse any of them.
+    for candidate in chain:
+        validate(candidate, immediate=candidate == directory)
+
+    # Create missing components from the first existing ancestor downwards.
+    for candidate in reversed(chain):
+        if validate(candidate, immediate=candidate == directory):
+            continue
+        try:
+            candidate.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        if not validate(candidate, immediate=candidate == directory):
+            raise PermissionError(
+                f"runtime env 目录创建后不可访问: {candidate}"
+            )
+
+
 def load_runtime_env() -> int:
     """将 runtime.env 注入进程环境变量，返回注入条数。"""
     try:
@@ -121,32 +196,47 @@ def load_runtime_env() -> int:
     return loaded
 
 
-# 本进程启动时由 runtime.env 注入的键。这类键的权威来源是 runtime.env
-# （管理台随时可改），get_secret 对它们实时重读，避免启动期快照过期。
+# 本进程启动时由 runtime.env 注入的键。这类键的权威来源是 runtime.env，
+# get_secret 对它们实时重读，避免启动期快照过期。
 _injected_keys: set[str] = set()
 
 
 def get_secret(key: str, default: str = "") -> str:
-    """读取密钥的当前值：管理台改 key 后无需重启进程即生效。
+    """读取密钥的当前值；更新受保护的 runtime.env 后无需重启即可生效。
 
     优先级与模块文档一致（真实环境变量 > runtime.env > default），
     唯一例外：键是本进程启动时由 runtime.env 注入的（真实环境变量为空），
     则每次调用实时重读 runtime.env——启动注入的快照不构成优先级。
-    典型场景：Celery worker 常驻运行，用户在管理台换 QuantDB API Key，
-    下一次定时同步任务即用新 key。
+    对这类键，文件删除、清空或变为不安全时直接返回 default，不回退到旧快照。
+    典型场景：常驻 worker 运行期间，部署者更新私有 runtime.env，
+    下一次定时同步任务即使用新 key。
     """
+    if key in _injected_keys:
+        # The environment value is only a startup snapshot of this file. If the
+        # file is removed, cleared, or becomes unsafe, never revive that stale
+        # snapshot as a fallback credential.
+        try:
+            return _parse(runtime_env_path()).get(key, "").strip() or default
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "get_secret(%s) runtime env reload failed (%s)",
+                key,
+                type(exc).__name__,
+            )
+            return default
+
+    env_val = os.environ.get(key, "").strip()
+    if env_val:
+        return env_val
     try:
-        if key in _injected_keys:
-            fresh = _parse(runtime_env_path()).get(key, "").strip()
-            if fresh:
-                return fresh
-        env_val = os.environ.get(key, "").strip()
-        if env_val:
-            return env_val
         return _parse(runtime_env_path()).get(key, "").strip() or default
     except Exception as exc:  # noqa: BLE001
-        logger.warning("get_secret(%s) 读取失败，回退进程环境变量: %s", key, exc)
-        return os.environ.get(key, "").strip() or default
+        logger.warning(
+            "get_secret(%s) runtime env read failed (%s)",
+            key,
+            type(exc).__name__,
+        )
+        return default
 
 
 def set_secret(key: str, value: str) -> Path:
@@ -157,15 +247,7 @@ def set_secret(key: str, value: str) -> Path:
         raise ValueError("配置值不能包含换行")
 
     path = runtime_env_path()
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if path.parent.is_symlink():
-        raise PermissionError(f"runtime env 目录不能是符号链接: {path.parent}")
-    if os.name == "posix":
-        parent_stat = path.parent.stat()
-        if parent_stat.st_uid != os.getuid() or parent_stat.st_mode & 0o022:
-            raise PermissionError(
-                f"runtime env 目录必须由当前用户拥有且不可被组/其他用户写入: {path.parent}"
-            )
+    _ensure_runtime_env_parent(path.parent)
 
     existing = _read_secure_text(path)
     lines = existing.splitlines() if existing is not None else []

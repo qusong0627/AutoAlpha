@@ -15,10 +15,8 @@ if ! "$VENV/bin/python" -c 'import sys; raise SystemExit(0 if sys.version_info[:
   echo "FATAL: 因子挖掘必须使用 Python 3.12，当前解释器：$("$VENV/bin/python" -V 2>&1)" >&2
   exit 1
 fi
-# 默认 0.0.0.0 是**刻意保留**的：Windows 侧的 wslrelay 是通过 WSL 的 eth0 IP
-# 连进来的，改成 127.0.0.1 会打断 Windows→localhost:8001 的访问链路。
-# 真正的局域网暴露面在 vite（跑在 Windows 上，见 web/vite.config.ts）。
-HOST=${HOST:-0.0.0.0}
+# 当前开发部署关闭用户认证，因此默认仅监听 WSL loopback。
+HOST=${HOST:-127.0.0.1}
 
 # ── 统一加载环境变量 / 受保护的 runtime.env ──────────────────────────
 # 非空进程环境变量优先；缺失时才从 ext4 上权限受限的 env 文件补齐。
@@ -51,7 +49,22 @@ require_env() {
 if [ -z "${INTERNAL_CALL_SECRET:-}" ] && [ -n "${DEV_SECRET:-}" ]; then
   INTERNAL_CALL_SECRET="$DEV_SECRET"   # 兼容旧变量名
 fi
-export INTERNAL_CALL_SECRET=$(require_env INTERNAL_CALL_SECRET)
+INTERNAL_CALL_SECRET=$(require_env INTERNAL_CALL_SECRET)
+export INTERNAL_CALL_SECRET
+if [ "${#INTERNAL_CALL_SECRET}" -lt 32 ]; then
+  echo "FATAL: INTERNAL_CALL_SECRET 长度不足 32 个字符；请生成随机值并写入受保护的 runtime.env。" >&2
+  exit 1
+fi
+case "$INTERNAL_CALL_SECRET" in
+  *[[:space:]]*)
+    echo "FATAL: INTERNAL_CALL_SECRET 不能包含空白字符。" >&2
+    exit 1
+    ;;
+  dev-internal-call-secret|changeme-*|quantmind-internal-secret|autoalpha-dev-internal-secret-9f3a)
+    echo "FATAL: INTERNAL_CALL_SECRET 是已公开或已退役的默认值，拒绝启动。" >&2
+    exit 1
+    ;;
+esac
 export PYTHONPATH="$ROOT"
 export ENABLE_STARTUP_DDL=${ENABLE_STARTUP_DDL:-1}
 export ENABLE_DOC_MINING=${ENABLE_DOC_MINING:-false}
@@ -64,12 +77,28 @@ export LOG_TRACE_PATH=${LOG_TRACE_PATH:-/data/alpha_agent_logs}
 export AUTH_DISABLED=${AUTH_DISABLED:-1}
 export DEV_USER_ID=${DEV_USER_ID:-10000001}
 export DEV_TENANT_ID=${DEV_TENANT_ID:-default}
+case "${AUTH_DISABLED,,}" in
+  1|true|yes)
+    case "$HOST" in
+      127.0.0.1|localhost|::1) ;;
+      *)
+        echo "FATAL: AUTH_DISABLED=$AUTH_DISABLED 时，HOST 必须绑定 loopback（127.0.0.1/localhost/::1）。" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+esac
 
 # LLM Key 只从服务端环境读取。当前 LLM client 支持以下任一变量；拒绝空值和
 # 仓库中常见的占位符，避免后端起来后所有挖掘任务才因没有凭证失败。
 has_llm_key=false
 for name in DEEPSEEK_API_KEY AI_IDE_LLM_API_KEY AI_IDE_API_KEY OPENAI_API_KEY; do
   value=$(printenv -- "$name" 2>/dev/null || true)
+  # Provider API keys are opaque tokens and must not contain whitespace; a
+  # whitespace-only or accidentally quoted value must not satisfy readiness.
+  if [[ "$value" =~ [[:space:]] ]]; then
+    continue
+  fi
   lower_value=${value,,}
   case "$lower_value" in
     ""|*your-deepseek-api-key*|*mock-api-key*|sk-在此*) continue ;;
@@ -99,9 +128,15 @@ export DB_PORT=${DB_PORT:-5432}
 export DB_NAME=${DB_NAME:-quantmind}
 export DB_USER=${DB_USER:-quantmind}
 if [ -z "${DATABASE_URL:-}" ]; then
-  export DB_PASSWORD=$(require_env DB_PASSWORD)
+  DB_PASSWORD=$(require_env DB_PASSWORD)
+  export DB_PASSWORD
   DB_PASSWORD_URLENCODED=$("$VENV/bin/python" -c 'import os, urllib.parse; print(urllib.parse.quote_plus(os.environ["DB_PASSWORD"]))')
   export DATABASE_URL="postgresql+asyncpg://${DB_USER}:${DB_PASSWORD_URLENCODED}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
+else
+  if ! DATABASE_URL="$DATABASE_URL" "$VENV/bin/python" -c 'import os, sys, urllib.parse; url = urllib.parse.urlsplit(os.environ["DATABASE_URL"]); sys.exit(0 if url.password else 1)'; then
+    echo "FATAL: DATABASE_URL 必须包含非空密码；或移除 DATABASE_URL 并提供 DB_PASSWORD。" >&2
+    exit 1
+  fi
 fi
 
 # 数据目录（/data/quantdb 是 E:\quantdb 的软链，见 scripts/wsl/link-quantdb.sh）

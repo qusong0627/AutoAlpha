@@ -136,49 +136,12 @@ export interface DocQuotaStatus {
 /** 解析通道：cloud=mineru.net 云端；local=自建/局域网 MinerU（数据不出网）。 */
 export type MineruMode = 'cloud' | 'local';
 
-/** 本地 MinerU 服务端 supported 档位；'' = 服务端默认。与后端 VALID_TIERS 同词表。 */
-export const MINERU_LOCAL_TIERS: Array<{ value: string; label: string }> = [
-  { value: '', label: '服务端默认' },
-  { value: 'flash', label: 'flash（极速，精度最低）' },
-  { value: 'basic', label: 'basic（基础）' },
-  { value: 'standard', label: 'standard（标准）' },
-  { value: 'advanced', label: 'advanced（最高精度，最慢）' },
-];
-
-/** 用户解析设置（GET/PUT/DELETE /docs/mineru-settings 的 settings 段）。 */
-export interface MineruUserSettings {
-  mode: MineruMode;
-  /** 该通道必填项是否齐（cloud=token，local=URL） */
-  configured: boolean;
-  api_token_set: boolean;
-  /** 掩码回显（前3****后4）；明文绝不回传 */
-  api_token_masked: string;
-  local_url: string;
-  local_api_key_set: boolean;
-  local_api_key_masked: string;
-  local_tier: string | null;
-}
-
+/** 部署级 MinerU 环境状态；不包含用户密钥或用户级设置。 */
 export interface MineruSettingsView {
-  /** null = 没配过（readable=false 时也为 null——两者用 readable 区分） */
-  settings: MineruUserSettings | null;
-  /** false = 设置存储读不到（Redis 故障）：不是「没配」，界面须区分 */
-  readable: boolean;
-  /** 生效来源：user=本页设置；env=部署默认（服务器 .env）；none=未配置 */
-  source: 'user' | 'env' | 'none';
+  source: 'env' | 'none';
   effective_mode: MineruMode | null;
   env_configured: boolean;
   env_mode: MineruMode | null;
-}
-
-export interface MineruSettingsPayload {
-  mode: MineruMode;
-  /** 留空 = 保留已存密钥（回显的是掩码，回存掩码会把真密钥写坏）；清除整条走 clear */
-  api_token?: string;
-  local_url?: string;
-  local_api_key?: string;
-  /** '' = 清为服务端默认档 */
-  local_tier?: string;
 }
 
 export interface OrganizeResult {
@@ -285,16 +248,11 @@ export async function getDocQuota(): Promise<DocQuotaStatus> {
 
 // ========================== 解析设置端点 ==========================
 
-/**
- * 读取解析设置（因子挖掘专属，租户+用户维度）。明文密钥绝不回传——
- * 回显的是掩码（前3****后4），保存时留空即「保留已存密钥」。
- */
+/** 读取部署级解析通道状态。密钥只存在服务端环境，不回传到浏览器。 */
 export async function getMineruSettings(): Promise<MineruSettingsView> {
   const res = await apiClient.get('/alpha-agent/docs/mineru-settings');
   const data = res.data?.data ?? {};
   return {
-    settings: (data.settings ?? null) as MineruUserSettings | null,
-    readable: data.readable !== false,
     source: (data.source ?? 'none') as MineruSettingsView['source'],
     effective_mode: (data.effective_mode ?? null) as MineruSettingsView['effective_mode'],
     env_configured: Boolean(data.env_configured),
@@ -302,29 +260,11 @@ export async function getMineruSettings(): Promise<MineruSettingsView> {
   };
 }
 
-/** 保存解析设置（部分更新：密钥字段留空 = 保留已存；'' → local_tier 清为服务端默认）。 */
-export async function saveMineruSettings(
-  payload: MineruSettingsPayload,
-): Promise<MineruSettingsView> {
-  const res = await apiClient.put('/alpha-agent/docs/mineru-settings', payload);
-  const data = res.data?.data ?? {};
-  return {
-    settings: (data.settings ?? null) as MineruUserSettings | null,
-    readable: data.readable !== false,
-    source: (data.source ?? 'none') as MineruSettingsView['source'],
-    effective_mode: (data.effective_mode ?? null) as MineruSettingsView['effective_mode'],
-    env_configured: Boolean(data.env_configured),
-    env_mode: (data.env_mode ?? null) as MineruSettingsView['env_mode'],
-  };
-}
-
-/** 清除本用户全部解析设置（云端+本地一起），回落到部署默认。 */
+/** 清除历史用户级解析设置记录；不修改部署环境变量。 */
 export async function clearMineruSettings(): Promise<MineruSettingsView> {
   const res = await apiClient.delete('/alpha-agent/docs/mineru-settings');
   const data = res.data?.data ?? {};
   return {
-    settings: (data.settings ?? null) as MineruUserSettings | null,
-    readable: data.readable !== false,
     source: (data.source ?? 'none') as MineruSettingsView['source'],
     effective_mode: (data.effective_mode ?? null) as MineruSettingsView['effective_mode'],
     env_configured: Boolean(data.env_configured),

@@ -43,7 +43,7 @@ export const put = <T = Row>(path: string, data: unknown) => request<T>(path, { 
 
 export interface Health { status: string; mounted: string[]; failed: Record<string, string>; startup: Record<string, string>; auth_disabled: boolean; startup_ddl: boolean; }
 export async function health(signal?: AbortSignal): Promise<Health> {
-  const { data } = await axios.get('/backend-health', { signal, timeout: 10000 });
+  const { data } = await axios.get('/health', { signal, timeout: 10000 });
   return data;
 }
 export interface DataSummary { available: boolean; error?: string; stock_count: number; date_range?: { start: string; end: string; trading_days: number }; datasets: Record<string, { columns: number; categories?: string[] }>; universes: Record<string, { name: string; count: number }>; }

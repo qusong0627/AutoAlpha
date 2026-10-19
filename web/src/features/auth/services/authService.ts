@@ -210,11 +210,11 @@ class AuthService {
     // 请求拦截器
     this.axiosInstance.interceptors.request.use(
       (config) => {
-        console.log(`[Auth Request] ${config.method?.toUpperCase()} ${config.url}`, config.data);
         return config;
       },
       (error) => {
-        console.error('[Auth Request Error]', error);
+        // Axios errors may retain request data, headers, and credentials.
+        // Keep the rejection path but never serialize the error to the console.
         return Promise.reject(error);
       }
     );
@@ -222,7 +222,6 @@ class AuthService {
     // 响应拦截器
     this.axiosInstance.interceptors.response.use(
       (response: AxiosResponse) => {
-        console.log(`[Auth Response] ${response.config.url}`, response.data);
         return response;
       },
       async (error) => {
@@ -251,7 +250,7 @@ class AuthService {
     const status = error.response?.status;
     const shouldSuppressErrorLog = !!config._suppressAuthErrorLog && status === 401;
     if (!shouldSuppressErrorLog) {
-      console.error(`[Auth] 处理错误: ${config.url}`, status || error.code || error.message);
+      console.error('[Auth] Request failed', status || error.code || 'unknown');
     }
 
     const isRefreshRequest = this.isRefreshRequest(config.url);
@@ -276,10 +275,10 @@ class AuthService {
           if (config.headers) {
             config.headers.Authorization = `Bearer ${newToken}`;
           }
-          console.log(`[Auth] Token刷新成功，重试请求: ${config.url}`);
+          console.log('[Auth] Token refreshed; retrying request');
           return axiosInstance.request(config);
         } catch (refreshError) {
-          console.error('[Auth] 自动重试过程中令牌刷新失败:', refreshError);
+          console.error('[Auth] Token refresh failed');
           this.recordRefreshFailure();
           this.clearTokens();
           // 返回原始错误
@@ -432,7 +431,7 @@ class AuthService {
         return;
       }
     } catch (error) {
-      console.error('验证码发送失败:', error);
+      console.error('验证码发送失败');
       throw this.handleError(error, 'send_verification_code');
     }
   }
@@ -524,7 +523,7 @@ class AuthService {
         );
       }
 
-      console.error('注册失败:', error);
+      console.error('注册失败');
       throw this.handleError(error, 'user_register');
     }
   }
@@ -628,7 +627,7 @@ class AuthService {
         );
       }
 
-      console.error('登录失败:', error);
+      console.error('登录失败');
       throw this.handleError(error, 'user_login');
     }
   }
@@ -651,7 +650,7 @@ class AuthService {
         );
       }
     } catch (error) {
-      console.error('登出请求失败:', error);
+      console.error('登出请求失败');
     } finally {
       // 无论请求是否成功，都清除本地令牌
       this.clearTokens();
@@ -683,7 +682,7 @@ class AuthService {
 
       return data.access_token;
     } catch (error) {
-      console.error('令牌刷新失败:', error);
+      console.error('令牌刷新失败');
       if ((error as any)?.response?.status === 401) {
         this.recordRefreshFailure();
         // 让调用者（handle401Error 或 initializeAuth）决定是否清除令牌
@@ -742,7 +741,7 @@ class AuthService {
       const data = this.unwrapResponse<{ available: boolean }>(response.data, '检查可用性失败');
       return data.available;
     } catch (error) {
-      console.error(`检查${type}可用性失败:`, error);
+      console.error(`检查${type}可用性失败`);
       // 检查失败时默认为可用，以免阻塞用户，或者根据需要抛出错误
       return true;
     }
@@ -765,7 +764,7 @@ class AuthService {
         throw new Error(response.data.message || '重置密码失败');
       }
     } catch (error) {
-      console.error('手机重置密码失败:', error);
+      console.error('手机重置密码失败');
       throw error;
     }
   }
@@ -799,7 +798,7 @@ class AuthService {
         throw new Error(response.data.message || '发送重置邮件失败');
       }
     } catch (error) {
-      console.error('忘记密码失败:', error);
+      console.error('忘记密码失败');
       throw error;
     }
   }
@@ -818,7 +817,7 @@ class AuthService {
         throw new Error(response.data.message || '密码重置失败');
       }
     } catch (error) {
-      console.error('密码重置失败:', error);
+      console.error('密码重置失败');
       throw error;
     }
   }
@@ -855,7 +854,7 @@ class AuthService {
     } catch (error) {
       const status = (error as any)?.response?.status;
       if (!(suppressUnauthorizedLog && status === 401)) {
-        console.error('获取当前用户失败:', error);
+        console.error('获取当前用户失败');
       }
       // Only clear tokens on auth errors (401/403), not network/timeout issues
       if (status === 401 || status === 403) {
@@ -892,7 +891,7 @@ class AuthService {
       try {
         return JSON.parse(userStr);
       } catch (error) {
-        console.error('解析用户信息失败:', error);
+        console.error('解析用户信息失败');
         this.clearTokens();
       }
     }
@@ -915,7 +914,7 @@ class AuthService {
       const currentTime = Math.floor(Date.now() / 1000);
       return payload.exp < currentTime;
     } catch (error) {
-      console.error('令牌解析失败:', error);
+      console.error('令牌解析失败');
       return true;
     }
   }

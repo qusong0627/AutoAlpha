@@ -19,6 +19,12 @@ if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ] || [ -L "$HOME" ]; then
   echo "FATAL: HOME must be an existing, non-symlink directory." >&2
   exit 1
 fi
+home_mode=$(stat -c '%a' -- "$HOME")
+if [ "$(stat -c '%u' -- "$HOME")" != "$(id -u)" ] \
+  || [[ ! "$home_mode" =~ ^[0-7]{3,4}$ ]] || (( (8#$home_mode & 022) != 0 )); then
+  echo "FATAL: HOME must be owned by the service user and not group/other-writable." >&2
+  exit 1
+fi
 
 config_dir="$HOME/.config"
 env_dir="$config_dir/autoalpha"
@@ -27,6 +33,16 @@ lock_file="$env_dir/.runtime-env.lock"
 if [ -L "$config_dir" ] || [ -L "$env_dir" ]; then
   echo "FATAL: config directories must not be symlinks." >&2
   exit 1
+fi
+if [ -e "$config_dir" ]; then
+  config_mode=$(stat -c '%a' -- "$config_dir")
+  if [ ! -d "$config_dir" ] || [ "$(stat -c '%u' -- "$config_dir")" != "$(id -u)" ] \
+    || [[ ! "$config_mode" =~ ^[0-7]{3,4}$ ]] || (( (8#$config_mode & 022) != 0 )); then
+    echo "FATAL: $config_dir must be owned by the service user and not group/other-writable." >&2
+    exit 1
+  fi
+else
+  mkdir -m 700 -- "$config_dir"
 fi
 mkdir -p -m 700 -- "$env_dir"
 chmod 700 -- "$env_dir"
@@ -134,6 +150,10 @@ if [ "$has_llm_key" != true ]; then
   printf '\n'
   if [ -z "$llm_key" ]; then
     echo "FATAL: LLM key cannot be empty." >&2
+    exit 1
+  fi
+  if [[ "$llm_key" =~ [[:space:]] ]]; then
+    echo "FATAL: LLM API key cannot contain whitespace." >&2
     exit 1
   fi
   lower_key=${llm_key,,}

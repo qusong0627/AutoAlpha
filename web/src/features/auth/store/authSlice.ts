@@ -76,7 +76,7 @@ export const initializeAuth = createAsyncThunk(
               ]) as string;
               localStorage.setItem('access_token', newToken);
             } catch (error) {
-              console.error('刷新Token失败:', error);
+              console.error('刷新Token失败');
               authService.clearTokens();
               return { user: null, token: null };
             }
@@ -109,7 +109,7 @@ export const initializeAuth = createAsyncThunk(
             token,
           };
         } catch (error) {
-          console.error('获取用户信息失败（含超时）:', error);
+          console.error('获取用户信息失败（含超时）');
           // 仅 401/403 清除 token（已在 getCurrentUser 内部处理）。
           // 网络错误/超时 = 服务器不可达：绝不拿本地缓存冒充已登录，
           // 打标后由路由层展示离线页，token 保留以便恢复后免登。
@@ -123,7 +123,7 @@ export const initializeAuth = createAsyncThunk(
         }
       }
     } catch (error) {
-      console.error('初始化认证状态失败:', error);
+      console.error('初始化认证状态失败');
       authService.clearTokens();
     }
 
@@ -243,7 +243,7 @@ export const logout = createAsyncThunk(
     try {
       await authService.logout();
     } catch (error: any) {
-      console.error('登出请求失败:', error);
+      console.error('登出请求失败');
       // 即使登出请求失败，也要清除本地状态
     }
   }

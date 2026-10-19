@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -11,11 +12,39 @@ from collections.abc import Mapping
 from typing import Any
 
 
-_SENSITIVE_ENV_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
+_SENSITIVE_ENV_MARKERS = (
+    "APIKEY",
+    "AUTHORIZATION",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "ACCESSKEY",
+    "PRIVATEKEY",
+    "SIGNINGKEY",
+    "CREDENTIAL",
+    "COOKIE",
+    "SUBSCRIPTIONKEY",
+)
+_CONNECTION_SECRET_ENV_NAMES = frozenset(
+    {
+        "DATABASEURL",
+        "DBURL",
+        "POSTGRESURL",
+        "REDISURL",
+        "CELERYBROKERURL",
+        "CELERYRESULTBACKEND",
+    }
+)
+_HEADER_ENV_NAMES = frozenset({"LLMEXTRAHEADERS", "QMFFACTORNAMESHEADERS"})
 _ASSIGNMENT = re.compile(
-    r"(?i)(\b(?:authorization|proxy-authorization)\b\s*[:=]\s*"
-    r"(?:[A-Za-z][\w-]*\s+)?|\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|"
-    r"password|secret)\b\s*[:=]\s*)"
+    r"(?i)(\b(?:[\w.-]*(?:authorization|proxy-authorization|api[_-]?key|"
+    r"access[_-]?key(?:[_-]?id)?|access[_-]?token|refresh[_-]?token|"
+    r"secret(?:[_-]?id|[_-]?access[_-]?key)?|password|private[_-]?key|"
+    r"signing[_-]?key|subscription[_-]?key|credentials?|"
+    r"database[_-]?url|db[_-]?url|postgres[_-]?url|redis[_-]?url|"
+    r"celery[_-]?(?:broker[_-]?url|result[_-]?backend))|"
+    r"authorization|proxy-authorization)"
+    r"[\"']?\s*[:=]\s*(?:[A-Za-z][\w-]*\s+)?)"
     r"(['\"]?)[^\s,;\"']+\2"
 )
 _BEARER = re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
@@ -36,8 +65,31 @@ def configured_secrets(extra_env: Mapping[str, str] | None = None) -> tuple[str,
     if extra_env:
         source.update(extra_env)
     for name, value in source.items():
-        if name.endswith(_SENSITIVE_ENV_SUFFIXES) and value and len(value) >= 4:
+        normalized_name = re.sub(r"[^A-Z0-9]", "", name.upper())
+        if not value:
+            continue
+        if normalized_name in _CONNECTION_SECRET_ENV_NAMES:
+            # Connection URLs can contain credentials in userinfo or query
+            # parameters. Redact the whole configured value wherever it appears.
+            if len(value) >= 4:
+                values.append(value)
+        elif any(marker in normalized_name for marker in _SENSITIVE_ENV_MARKERS):
+            if len(value) >= 4:
+                values.append(value)
+        if normalized_name in _HEADER_ENV_NAMES:
+            # These variables are JSON maps of outbound HTTP headers. Treat each
+            # value as sensitive because custom provider headers can carry keys.
             values.append(value)
+            try:
+                headers = json.loads(value)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(headers, dict):
+                values.extend(
+                    str(header_value)
+                    for header_value in headers.values()
+                    if header_value is not None and len(str(header_value)) >= 4
+                )
     return tuple(sorted(set(values), key=len, reverse=True))
 
 
