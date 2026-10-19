@@ -340,6 +340,7 @@ class TaskStatus(str, Enum):
     QUEUED = "queued"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class QueueFullError(RuntimeError):
@@ -1515,8 +1516,17 @@ class AlphaAgentLauncher:
 
     async def get_task_status(self, task_id: str) -> dict[str, Any] | None:
         task = self._tasks.get(task_id)
+        durable = None
+        try:
+            durable = await _task_store().get_task(
+                task_id, user_id=task.user_id if task else None
+            )
+        except Exception as exc:
+            logger.warning("task state reconciliation failed for %s: %s", task_id, exc)
         if not task:
-            return None
+            return durable
+        if durable and durable.get("status") in {"completed", "failed", "cancelled"}:
+            await self._apply_terminal_state(task, durable)
         return redact_data({
             "task_id": task.task_id,
             "user_id": task.user_id,
@@ -1538,7 +1548,7 @@ class AlphaAgentLauncher:
             "universe": task.universe,
             "data_source": task.data_source,
             "direction": task.direction,
-            "error_message": redact_text(task.error_message),
+            "error_message": redact_text(task.error_message) if task.error_message else None,
             "result": task.result,
             "timeline": task.timeline,
             "token_usage": task.token_usage,
@@ -1560,6 +1570,46 @@ class AlphaAgentLauncher:
             ),
         })
 
+    async def _apply_terminal_state(self, task: EvolutionTask, durable: dict) -> None:
+        """A durable terminal state fences both preparation and mining processes."""
+        status = TaskStatus(durable["status"])
+        changed = task.status != status or task.error_message != durable.get("error")
+        if task.status in (TaskStatus.PENDING, TaskStatus.QUEUED, TaskStatus.RUNNING):
+            task._cancel_requested = True
+        task.status = status
+        task.phase = status.value
+        task.error_message = durable.get("error")
+        task.progress = {
+            TaskStatus.COMPLETED: "因子挖掘完成",
+            TaskStatus.FAILED: "任务已停止，请查看失败原因",
+            TaskStatus.CANCELLED: "任务已取消",
+        }[status]
+        task.progress_pct = int(durable.get("progress_pct") or task.progress_pct)
+        if status == TaskStatus.COMPLETED:
+            task.progress_pct = 100
+        if task._cancel_requested and task.process and task.process.poll() is None:
+            await _terminate_task_process_group(task.process)
+        if changed:
+            self._persist_task(task)
+
+    async def reconcile_terminal_tasks(self) -> None:
+        for task in list(self._tasks.values()):
+            if task.status in (TaskStatus.PENDING, TaskStatus.QUEUED, TaskStatus.RUNNING):
+                await self.get_task_status(task.task_id)
+
+    def forget_terminal_task(self, task_id: str) -> bool:
+        """Drop a terminal task from this process after its durable row is deleted."""
+        task = self._tasks.get(task_id)
+        if task is None or task.status in (
+            TaskStatus.PENDING,
+            TaskStatus.QUEUED,
+            TaskStatus.RUNNING,
+        ):
+            return False
+        self._tasks.pop(task_id, None)
+        self._owned_queued_task_ids.discard(task_id)
+        return True
+
     async def cancel_task(self, task_id: str) -> bool:
         task = self._tasks.get(task_id)
         if not task:
@@ -1579,7 +1629,9 @@ class AlphaAgentLauncher:
                 pass
             except Exception as e:
                 logger.warning("Failed to kill process for task %s: %s", task_id, e)
-        task.status = TaskStatus.FAILED
+        task.status = TaskStatus.CANCELLED
+        task.phase = "cancelled"
+        task.progress = "任务已取消"
         task.error_message = "Cancelled by user"
         self._persist_task(task)
         await self._db_cancel(task)
@@ -1610,7 +1662,7 @@ class AlphaAgentLauncher:
 
     async def list_tasks(self, user_id: str | None = None) -> list[dict[str, Any]]:
         results = []
-        for task in self._tasks.values():
+        for task in list(self._tasks.values()):
             if user_id and task.user_id != user_id:
                 continue
             results.append(await self.get_task_status(task.task_id))
@@ -1708,6 +1760,13 @@ class AlphaAgentLauncher:
                 task.status = TaskStatus.FAILED
                 task.error_message = "Mining task ownership lease was lost"
                 task.progress = task.error_message
+                task.phase = "failed"
+            try:
+                durable = await _task_store().get_task(task.task_id, user_id=task.user_id)
+                if durable and durable.get("status") in {"completed", "failed", "cancelled"}:
+                    await self._apply_terminal_state(task, durable)
+            except Exception as exc:
+                logger.warning("could not reconcile lost lease for %s: %s", task.task_id, exc)
             self._persist_task(task)
             if task.process:
                 try:
@@ -1741,7 +1800,7 @@ class AlphaAgentLauncher:
                 await store.mark_terminal(
                     task.task_id,
                     status=task.status.value,
-                    error=redact_text(task.error_message),
+                    error=redact_text(task.error_message) if task.error_message else None,
                     factor_count=factor_count,
                 )
                 return
@@ -1852,7 +1911,7 @@ class AlphaAgentLauncher:
                 "loop_n": task.loop_n,
                 "current_loop": task.current_loop,
                 "created_at": task.created_at,
-                "error_message": redact_text(task.error_message),
+                "error_message": redact_text(task.error_message) if task.error_message else None,
                 "timeline": task.timeline,
                 "token_usage": task.token_usage,
             }
@@ -1979,7 +2038,107 @@ class AlphaAgentLauncher:
         )
         return str(template)
 
-    async def _run_evolution(
+    async def _task_heartbeat(self, task: EvolutionTask) -> None:
+        """Renew ownership during every await, including slow preparation."""
+        while not task._cancel_requested:
+            await asyncio.sleep(_DB_SYNC_INTERVAL_S)
+            if task.status != TaskStatus.RUNNING or task._cancel_requested:
+                return
+            await self._db_sync_progress_throttled(task)
+
+    async def _run_evolution(self, task: EvolutionTask, **kwargs: Any) -> None:
+        heartbeat = asyncio.create_task(
+            self._task_heartbeat(task), name=f"mining-heartbeat-{task.task_id}"
+        )
+        try:
+            await self._execute_evolution(task, **kwargs)
+        except asyncio.CancelledError:
+            if task.process and task.process.poll() is None:
+                await _terminate_task_process_group(task.process)
+            raise
+        except Exception as exc:
+            if not task._cancel_requested:
+                task.status = TaskStatus.FAILED
+                task.phase = "failed"
+                task.error_message = redact_text(exc)
+                task.progress = "任务启动失败，请查看失败原因"
+                self._persist_task(task)
+                await self._db_finish(task)
+            logger.exception("Task %s preparation/startup failed", task.task_id)
+        finally:
+            heartbeat.cancel()
+            try:
+                await heartbeat
+            except asyncio.CancelledError:
+                pass
+            await self._drain_after_finish()
+
+    async def _prepare_qlib_data(self, task: EvolutionTask) -> str | None:
+        """Use a process so cancellation also stops DuckDB and cache writes."""
+        task_log_dir = self._log_dir / task.task_id
+        _secure_task_log_dir(task_log_dir)
+        result_file = task_log_dir / "qlib_provider.json"
+        result_file.unlink(missing_ok=True)
+        log_fd = os.open(
+            task_log_dir / "subprocess_stdout.log",
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        log_fh = os.fdopen(log_fd, "ab")
+        process = None
+        stream_thread = None
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(
+            filter(None, (str(_ALGO_REPO_ROOT), env.get("PYTHONPATH", "")))
+        )
+        try:
+            if task._cancel_requested:
+                return None
+            process = subprocess.Popen(
+                [sys.executable, "-m", "backend.services.engine.alpha_agent.prepare_qlib",
+                 "--result-file", str(result_file)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=env,
+                cwd=str(_ALGO_REPO_ROOT),
+                start_new_session=True,
+            )
+            task.process = process
+            assert process.stdout is not None
+            stream_thread = threading.Thread(
+                target=_stream_redacted_child_output,
+                args=(process.stdout, log_fh, env, task.task_id),
+                name=f"preparation-log-{task.task_id}",
+                daemon=True,
+            )
+            stream_thread.start()
+            self._persist_task(task)
+            while process.poll() is None:
+                if task._cancel_requested:
+                    await _terminate_task_process_group(process)
+                    return None
+                await asyncio.sleep(0.25)
+            await asyncio.to_thread(stream_thread.join, 15)
+            if task._cancel_requested:
+                return None
+            if process.returncode != 0:
+                detail = self._tail_error_log(task_log_dir) or f"数据准备进程异常退出（代码 {process.returncode}）"
+                raise RuntimeError(
+                    f"QuantDB / Qlib 数据准备失败：{detail}"
+                )
+            return str(json.loads(result_file.read_text(encoding="utf-8"))["provider_uri"])
+        finally:
+            if process is not None and process.poll() is None:
+                await _terminate_task_process_group(process)
+            if stream_thread is not None:
+                await asyncio.to_thread(stream_thread.join, 15)
+            else:
+                log_fh.close()
+            task.process = None
+            result_file.unlink(missing_ok=True)
+            self._persist_task(task)
+
+    async def _execute_evolution(
         self,
         task: EvolutionTask,
         *,
@@ -2000,29 +2159,10 @@ class AlphaAgentLauncher:
             return
 
         if task.data_source.lower().strip() == "parquet":
-            try:
-                def prepare_provider() -> str:
-                    from backend.services.engine.rd_agent.rd_loop_wrapper import (
-                        RDLoopWrapper,
-                    )
-
-                    quantdb_dir = RDLoopWrapper._resolve_quantdb_dir()
-                    if not quantdb_dir:
-                        return "/app/db/feature_snapshots"
-                    from backend.services.engine.qlib_data_builder import ensure_qlib_cache
-
-                    return ensure_qlib_cache(quantdb_dir)
-
-                provider_uri = await asyncio.to_thread(prepare_provider)
-            except Exception as exc:  # noqa: BLE001 - surface preparation failure on task
-                task.status = TaskStatus.FAILED
-                task.error_message = f"QuantDB / Qlib 数据准备失败：{exc}"
-                task.progress = task.error_message
-                self._persist_task(task)
-                await self._db_finish(task)
-                logger.exception("Task %s QuantDB/Qlib preparation failed", task.task_id)
-                await self._drain_after_finish()
+            prepared_uri = await self._prepare_qlib_data(task)
+            if prepared_uri is None or task._cancel_requested:
                 return
+            provider_uri = prepared_uri
 
             task.phase = "starting"
             task.progress = "数据准备完成，正在启动因子挖掘..."
@@ -2147,7 +2287,7 @@ class AlphaAgentLauncher:
             # 补齐 RD-Agent litellm 后端需要的 LITELLM_ 前缀变量（deepseek 优先）
             if llm_overrides:
                 # 显式写入 LITELLM_ 覆盖，绕开 build_llm_env 里 os.getenv 的 mock 占位符链
-                for _k in ("LITELLM_OPENAI_API_KEY", "LITELLM_OPENAI_API_BASE"):
+                for _k in ("LITELLM_OPENAI_API_KEY", "LITELLM_OPENAI_API_BASE", "LITELLM_CHAT_MODEL"):
                     if llm_overrides.get(_k):
                         env[_k] = llm_overrides[_k]
 
@@ -2192,6 +2332,10 @@ class AlphaAgentLauncher:
             adapter = get_adapter(task.market)
             adapter_env = adapter.get_env_overrides()
             env.update(adapter_env)
+            # Adapters may emit empty CHAT_MODEL from the API process. Restore
+            # the already selected LITELLM model before spawning the runner.
+            if algo.uses_llm:
+                build_llm_env(env)
         except Exception as e:
             logger.warning("Failed to get market adapter env: %s", e)
 
@@ -2283,11 +2427,11 @@ class AlphaAgentLauncher:
             if task._cancel_requested:
                 return
 
-            log_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+            log_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
             log_fd = os.open(stdout_log, log_flags, 0o600)
             if os.name == "posix":
                 os.fchmod(log_fd, 0o600)
-            log_fh = os.fdopen(log_fd, "wb")
+            log_fh = os.fdopen(log_fd, "ab")
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -2323,7 +2467,6 @@ class AlphaAgentLauncher:
                         pass
                     break
                 self._refresh_progress(task, task_log_dir, algo)
-                await self._db_sync_progress_throttled(task)
                 if task._cancel_requested:
                     break
                 await asyncio.sleep(3)
@@ -2355,11 +2498,16 @@ class AlphaAgentLauncher:
                     task.task_id,
                 )
 
+            if task._cancel_requested:
+                return
+
             # 收尾前最后一次刷新：把子进程写出的末几个阶段收进时间线
             self._refresh_progress(task, task_log_dir, algo, finished=True)
 
             if process.returncode == 0:
                 task.result = await self._persist_rd_agent_results(task, task_log_dir)
+                if task._cancel_requested:
+                    return
                 task.status = TaskStatus.COMPLETED
                 task.phase = "completed"
                 task.progress_pct = 100
@@ -2367,6 +2515,7 @@ class AlphaAgentLauncher:
                 self._spawn_factor_naming(task)
             else:
                 task.status = TaskStatus.FAILED
+                task.phase = "failed"
                 error_output = self._tail_error_log(task_log_dir)
                 task.error_message = (
                     f"Process exited with code {process.returncode}: {error_output}"
@@ -2381,7 +2530,10 @@ class AlphaAgentLauncher:
             await self._db_finish(task)
 
         except Exception as e:
+            if task._cancel_requested:
+                return
             task.status = TaskStatus.FAILED
+            task.phase = "failed"
             task.error_message = redact_text(e)
             logger.exception("Factor mining exception for task %s", task.task_id)
             if stream_thread is None and log_fh is not None:
@@ -2391,10 +2543,6 @@ class AlphaAgentLauncher:
                     pass
             self._persist_task(task)
             await self._db_finish(task)
-        finally:
-            # 名额释放后立即补位排队任务（成功/失败/取消任何收尾路径都算）。
-            # 排水自身吞异常——它绝不能改写本任务的终态。
-            await self._drain_after_finish()
 
     _PHASE_ORDER = [
         ("scenario", "scenario", "初始化场景"),
@@ -3069,9 +3217,14 @@ class AlphaAgentLauncher:
                 reverse=True,
             )
             if not logs:
-                return ""
-            with open(logs[0], errors="replace") as f:
-                return redact_text(f.read()[-max_chars:])
+                stdout = log_dir / "subprocess_stdout.log"
+                if not stdout.is_file():
+                    return ""
+                logs = [stdout]
+            with open(logs[0], "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - max_chars * 4))
+                return redact_text(f.read().decode("utf-8", errors="replace")[-max_chars:])
         except Exception:
             return ""
 

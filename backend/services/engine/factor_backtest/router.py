@@ -47,6 +47,7 @@ from backend.services.engine.factor_backtest.report import (
 from backend.services.engine.factor_backtest.report_pdf import export_report_pdf
 from backend.services.engine.factor_backtest.profiles import (
     columns_for_market,
+    effective_run_timeout_s,
     get_market_profile,
     list_market_profiles,
     profile_status,
@@ -67,6 +68,13 @@ from backend.services.engine.routers.alpha_agent import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/factor-backtest", tags=["factor-backtest"])
+
+#: 后台求值任务句柄（factor_id → (run_id, Task)）。取消必须**真正取消协程**：
+#: 旧实现只 kill 子进程 + 改库里的行，任务若卡在取数线程（`asyncio.to_thread`）
+#: 上就不会 unwind——内存里的去重位（`_running_backtests`）一直被占着，同一因子
+#: 在整段超时窗内无法重跑。identity 守卫与 `_running_backtest_runs` 同纪律：
+#: 只有 run_id 匹配的那个任务才可被取消/清理（延迟收尾不得拆新任务）。
+_running_backtest_tasks: dict[str, tuple[str, "asyncio.Task[None]"]] = {}
 
 #: 矩阵单元格展示的指标键（metrics_json 里拣出来的排序维度）。
 _CELL_METRIC_KEYS = (
@@ -257,6 +265,11 @@ async def cancel_single_backtest(factor_id: str, request: Request):
             await store.finish_run(run_id, "cancelled", error="cancelled_by_user")
         except Exception as exc:  # noqa: BLE001 — 收口失败由任务侧兜底
             logger.warning("[factor-backtest] cancel 收口失败 %s: %s", run_id, exc)
+    # 台账已终态，最后才取消协程：卡在取数线程上的任务不会响应 kill 子进程，
+    # 只有 cancel 才能让它 unwind 并释放去重位（否则同一因子要等整体超时才能重跑）。
+    task_entry = _running_backtest_tasks.get(factor_id)
+    if task_entry is not None and (run_id is None or task_entry[0] == run_id):
+        task_entry[1].cancel()
     return {"code": 200, "data": {"factor_id": factor_id, "status": "cancelled"}}
 
 
@@ -282,14 +295,26 @@ async def evaluate_and_record(
     """
     try:
         with backtest_run_scope(factor_id, run_id):
-            res = await evaluate_factor_market(
-                factor,
-                market=market,
-                universe=universe,
-                start=start,
-                end=end,
-                cost_bps=cost_bps,
-            )
+            # 整体上限：兜住「卡在取数/求值里、连子进程都还没起来」的情况
+            # （单步超时只在 engine 的三处同步取数上；这里是最后一道，保证终态）。
+            # 必须大于因子子进程的 600s 上限，让那条路先走完它自己的进程组回收。
+            run_timeout = effective_run_timeout_s()
+            try:
+                res = await asyncio.wait_for(
+                    evaluate_factor_market(
+                        factor,
+                        market=market,
+                        universe=universe,
+                        start=start,
+                        end=end,
+                        cost_bps=cost_bps,
+                    ),
+                    timeout=run_timeout,
+                )
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"回测整体超时（>{run_timeout}s）：数据装载/求值未在时限内完成"
+                ) from exc
         win = res.get("window") or {}
         date_range = (
             f"{win.get('start')}~{win.get('end')}" if win.get("start") else None
@@ -368,6 +393,9 @@ async def _run_single(
     抛），finally 做身份守卫清理。
     """
     try:
+        task = asyncio.current_task()
+        if task is not None:
+            _running_backtest_tasks[factor_id] = (run_id, task)
         await evaluate_and_record(
             factor_id,
             factor,
@@ -378,9 +406,19 @@ async def _run_single(
             end=end,
             cost_bps=cost_bps,
         )
+    except asyncio.CancelledError:
+        # 用户取消：端点已把台账收口 cancelled 并 cancel 本任务。这里吞掉，
+        # 让调用方（批量 worker）按正常返回继续排水——CancelledError 直接外抛会
+        # 穿过 worker 的 ``except Exception``（它是 BaseException），把整个批次的
+        # 队列悄悄掐断。非用户取消（进程关停）照旧外抛，关停必须可打断。
+        if factor_id not in _backtest_cancelled:
+            raise
     except Exception:  # noqa: BLE001 — 终态已收口（含 cancelled），后台任务无处可抛
         pass
     finally:
+        entry = _running_backtest_tasks.get(factor_id)
+        if entry is not None and entry[0] == run_id:
+            _running_backtest_tasks.pop(factor_id, None)
         # 身份守卫清理（照旧链 finally 注释）：取消→立即重跑后，旧任务延迟收尾
         # 不得拆新任务的去重键/取消标记。
         if (

@@ -1,4 +1,4 @@
-"""quantdb_data —— 因子取数入口（平台生成，因子代码勿修改）。
+"""quantdb_data —— AutoAlpha 因子取数入口（平台生成，因子代码勿修改）。
 
 因子数据统一从 QuantDB 本地仓库（parquet）读取，两个入口::
 
@@ -8,7 +8,7 @@
     df = qd.daily('l1_factors', ['turn_20'])                # 日频特征宽表
     fin = qd.financial('pershare_index', ['du_return_on_equity'])
 
-实现（与 superalpha 同契约、不同引擎）：本模块经仓库既有
+AutoAlpha 取数实现：本模块经仓库既有
 ``QuantDBDataHub``（DuckDB 精确分区直读）取数，不依赖 ``quantdb-sdk``；
 平台把本文件下发（软链/复制）到因子执行目录，因子代码 ``import quantdb_data
 as qd`` 即可取数。``panel()`` 读任务目录面板文件（``QUANTDB_PANEL_PATH``）

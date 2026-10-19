@@ -248,7 +248,10 @@ if not provider_uri:
     raise RuntimeError("Qlib provider is not configured")
 qlib.init(provider_uri=provider_uri, region="cn", kernels=1)
 
-namespace = {{}}
+# __file__ 必须显式给：因子代码用 dirname(abspath(__file__)) 定位自己的目录，
+# 而 exec 的命名空间默认没有它。这里因子源码本来就是从这个真实文件读的，
+# 直接指回去，语义与挖掘侧一致。
+namespace = {{"__file__": {str(factor_path)!r}}}
 with open({str(factor_path)!r}, "r", encoding="utf-8") as source:
     untrusted_source = source.read(256 * 1024 + 1)
 if len(untrusted_source.encode("utf-8")) > 256 * 1024:

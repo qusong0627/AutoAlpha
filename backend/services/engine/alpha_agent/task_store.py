@@ -685,6 +685,20 @@ class MiningTaskStore:
             row = (await session.execute(text(query), params)).mappings().first()
         return row_to_dict(row) if row else None
 
+    async def delete_terminal_task(self, task_id: str, *, user_id: str) -> bool:
+        """Delete one user's terminal task row; active tasks are never removable."""
+        async with get_session() as session:
+            result = await session.execute(
+                text(
+                    "DELETE FROM rd_agent_mining_tasks "
+                    "WHERE task_id = :task_id AND user_id = :user_id "
+                    "AND status IN ('completed', 'failed', 'cancelled') "
+                    "RETURNING task_id"
+                ),
+                {"task_id": task_id, "user_id": user_id},
+            )
+            return result.fetchone() is not None
+
     async def list_history(
         self,
         *,

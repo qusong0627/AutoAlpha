@@ -255,6 +255,101 @@ button:focus-visible, a:focus-visible { outline: 3px solid #b2c0ff; outline-offs
 .spec-value { font-size: 13px; font-weight: 800; color: #1e293b; line-height: 1.5; }
 .spec-hint { font-size: 11px; color: #64748b; line-height: 1.6; margin-top: 2px; }
 
+/* ---------- backtest progress (口径 → 台账 之间的实时进度容器) ---------------- */
+
+.progress-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #64748b;
+  font-variant-numeric: tabular-nums;
+}
+.progress-live i {
+  width: 7px; height: 7px; border-radius: 999px;
+  background: var(--down);
+  box-shadow: 0 0 0 3px #18b38a0f;
+  animation: aa-progress-pulse 1.6s ease-in-out infinite;
+}
+.progress-board { display: flex; flex-direction: column; gap: 10px; }
+.progress-row {
+  display: grid;
+  grid-template-columns: minmax(190px, 1.15fr) minmax(240px, 1.6fr) auto;
+  align-items: center;
+  justify-items: center;
+  gap: 16px;
+  padding: 13px 15px;
+  border: 1px solid #eef2f6;
+  border-radius: var(--radius-card);
+  background: rgba(248, 250, 252, .85);
+  text-align: center;
+}
+.progress-main { display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 0; }
+/* 批次行只有一条主列（进度条 + 计数），不需要三点布局 */
+.progress-row.batch { grid-template-columns: minmax(0, 1fr); }
+.progress-main strong { font-size: 13px; font-weight: 700; color: var(--ink-1); overflow-wrap: anywhere; }
+.progress-main .subtle { font-size: 11px; line-height: 1.6; }
+.progress-meter { display: flex; flex-direction: column; align-items: center; gap: 7px; min-width: 0; width: 100%; }
+.progress-meta { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 9px; font-size: 11px; color: #64748b; font-variant-numeric: tabular-nums; }
+.progress-note { color: #b45309; }
+.progress-bar {
+  position: relative;
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(79, 99, 243, .1);
+  overflow: hidden;
+}
+.progress-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--brand-gradient);
+  transition: width .4s ease;
+}
+/* 单跑没有可信百分比（台账只在收口时落数）——用不定态滑动条，绝不编一个进度 */
+.progress-bar.indeterminate > span { width: 34%; animation: aa-progress-slide 1.7s ease-in-out infinite; }
+.progress-stats { display: flex; align-items: baseline; justify-content: center; flex-wrap: wrap; gap: 16px; font-size: 11.5px; color: #64748b; font-variant-numeric: tabular-nums; }
+.progress-stats b { font-size: 15px; font-weight: 700; color: var(--ink-1); margin-right: 3px; }
+.progress-pct { font-family: var(--font-mono); font-size: 12px; color: var(--accent); }
+.progress-top { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9px; text-align: center; }
+.progress-top strong { font-size: 13px; font-weight: 700; }
+.progress-top .actions { justify-content: center; }
+.progress-current { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+.progress-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 9px; border-radius: 8px;
+  background: rgba(79, 99, 243, .07);
+  font-size: 11px; color: #4a5670;
+  max-width: 100%; overflow-wrap: anywhere;
+}
+.progress-idle {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  padding: 20px 15px;
+  border: 1px dashed #e3e9f2;
+  border-radius: var(--radius-card);
+  background: rgba(255, 255, 255, .55);
+  text-align: center;
+}
+.progress-idle .progress-idle-icon {
+  display: grid; place-items: center;
+  width: 34px; height: 34px; border-radius: 11px;
+  background: rgba(241, 244, 255, .9); color: #6d7ef0; flex: 0 0 auto;
+}
+.progress-idle strong { display: block; font-size: 12.5px; font-weight: 700; color: #3f4a60; }
+.progress-idle .subtle { font-size: 11px; line-height: 1.6; max-width: 520px; }
+@keyframes aa-progress-slide {
+  0% { transform: translateX(-105%); }
+  100% { transform: translateX(320%); }
+}
+@keyframes aa-progress-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .35; }
+}
+
 /* ---------- stats ---------------------------------------------------------- */
 
 .stat-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 23px; }
@@ -801,6 +896,8 @@ button:focus-visible, a:focus-visible { outline: 3px solid #b2c0ff; outline-offs
   .two-columns { grid-template-columns: 1fr; }
   .card-grid.cols-3, .card-grid.cols-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .spec-grid, .spec-grid.cols-5 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .progress-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .progress-meter { grid-column: 1 / -1; }
 }
 
 @media (max-width: 650px) {

@@ -40,6 +40,22 @@ export async function request<T = Row>(path: string, config: AxiosRequestConfig 
 export const get = <T = Row>(path: string, params?: Row, signal?: AbortSignal) => request<T>(path, { params, signal });
 export const post = <T = Row>(path: string, data?: unknown, params?: Row) => request<T>(path, { method: 'POST', data, params, timeout: 120000 });
 export const put = <T = Row>(path: string, data: unknown) => request<T>(path, { method: 'PUT', data });
+export const del = <T = Row>(path: string) => request<T>(path, { method: 'DELETE' });
+
+interface TaskLog { lines: string[]; total: number; offset?: number; }
+export async function getLatestTaskLog(taskId: string, signal: AbortSignal) {
+  const path = `${ALPHA}/tasks/${encodeURIComponent(taskId)}/log`;
+  const windowSize = 300;
+  const initial = await get<TaskLog>(path, { tail: windowSize }, signal);
+  if (typeof initial.offset === 'number' || initial.total <= windowSize) {
+    return { ...initial, offset: initial.offset ?? 0, fetchedAt: Date.now() };
+  }
+  // Older running servers interpret tail as a page size. Resolve the last page
+  // explicitly until the backend can be restarted after active mining finishes.
+  const offset = Math.max(0, initial.total - windowSize);
+  const latest = await get<TaskLog>(path, { tail: windowSize, offset }, signal);
+  return { ...latest, offset, fetchedAt: Date.now() };
+}
 
 export interface Health { status: string; mounted: string[]; failed: Record<string, string>; startup: Record<string, string>; auth_disabled: boolean; startup_ddl: boolean; }
 export async function health(signal?: AbortSignal): Promise<Health> {

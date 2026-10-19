@@ -139,6 +139,7 @@ async def _sweep_task_leases_once() -> None:
     launcher.adopt_queued_tasks(claimed)
     await store.renew_queued_leases()
     await store.reconcile_orphans()
+    await launcher.reconcile_terminal_tasks()
     await launcher.drain_queue()
 
 
@@ -201,6 +202,21 @@ async def lifespan(_app: FastAPI):
     except Exception as e:  # noqa: BLE001
         _STARTUP["task_lease_sweep"] = f"{type(e).__name__}: {e}"
         logger.warning("startup mining task lease sweep failed: %r", e)
+
+    # 回测台账的孤儿 running 行收口 + 中断批次续跑。上游入口 engine/main.py 在启动时
+    # 调 ``factor_backtest.batch.resume_interrupted()``，本独立入口此前没调，于是
+    # 「引擎被 kill/重启时正在跑的单跑」会永远停在 running（实测 2026-10-19：
+    # 17:17:03 那行直到手动收口都还在 running）。这里补上同一段重启恢复语义。
+    try:
+        from backend.services.engine.factor_backtest import batch as _fb_batch
+
+        resumed = await _fb_batch.resume_interrupted()
+        _STARTUP["factor_backtest_resume"] = (
+            "ok" if not resumed else f"ok ({resumed} 个中断批次续跑)"
+        )
+    except Exception as e:  # noqa: BLE001 — 恢复失败不拦启动
+        _STARTUP["factor_backtest_resume"] = f"{type(e).__name__}: {e}"
+        logger.warning("startup factor-backtest recovery failed: %r", e)
 
     lease_sweeper = asyncio.create_task(
         _task_lease_sweeper(), name="mining-task-lease-sweeper"

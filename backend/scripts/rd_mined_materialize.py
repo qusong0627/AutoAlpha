@@ -468,7 +468,10 @@ factor_code = os.environ["RDM_FACTOR_CODE"]
 out_parquet = os.environ["RDM_OUT_PARQUET"]
 
 try:
-    _ns = {"__name__": "__main__"}
+    # __file__ 必须补进命名空间：因子代码常用 dirname(abspath(__file__)) 定位
+    # 产物目录，而 exec 的命名空间默认没有它（只给了 __name__）→ NameError。
+    # 本 runner 本身就是运行目录下的真实脚本，__file__ 即该路径，语义与挖掘一致。
+    _ns = {"__name__": "__main__", "__file__": __file__}
     exec(factor_code, _ns)
     _results = [
         f for f in os.listdir(".")

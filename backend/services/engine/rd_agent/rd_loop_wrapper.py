@@ -340,7 +340,7 @@ class RDLoopWrapper:
         # litellm needs provider prefix for non-OpenAI models
         model = env.get("CHAT_MODEL", "")
         if model and not model.startswith(
-            ("openai/", "azure/", "anthropic/", "huggingface/")
+            ("openai/", "azure/", "anthropic/", "huggingface/", "deepseek/")
         ):
             env["CHAT_MODEL"] = f"openai/{model}"
         env["REASONING_MODEL"] = env.get("CHAT_MODEL", "")
@@ -648,7 +648,7 @@ class RDLoopWrapper:
         ``_ensure_panel_bundle``）——没有这一步，``FactorRDLoop`` 构造期即失败
         （``file type panel.parquet is not supported``）。
 
-        与 superalpha 部署一致的 monkeypatch 扩展（不改 vendored 源码）：``panel.parquet``
+        AutoAlpha 的运行时兼容扩展（不改 vendored 源码）：``panel.parquet``
         给出固定说明、``.py`` 注入其模块 docstring（SDK 的 docstring 本身就是给模型的用法
         与口径约定）、其余数据文件给通用说明；未知类型仍走原始实现。
         """

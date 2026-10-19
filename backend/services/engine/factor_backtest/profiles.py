@@ -198,6 +198,27 @@ def effective_min_days() -> int:
     return _env_int("QM_BACKTEST_MIN_DAYS", 120)
 
 
+def effective_data_timeout_s() -> int:
+    """单步同步取数的等待上限（env ``QM_BACKTEST_DATA_TIMEOUT_SECONDS``，默认 300s）。
+
+    覆盖 qlib ``D.features`` 行情装载、动态流动性池、基准 parquet 三处
+    ``to_thread``。正常冷启动几十秒；但底层读一旦卡住（bin 冷读、joblib worker
+    卡死），**没有上限的等待会让 run 永远停在 running**——台账无终态、内存去重位
+    不释放、取消也只改库里的行（2026-10-19 线上实测：D.features 卡 >10 分钟）。
+    """
+    return _env_int("QM_BACKTEST_DATA_TIMEOUT_SECONDS", 300)
+
+
+def effective_run_timeout_s() -> int:
+    """单次 run 的整体上限（env ``QM_BACKTEST_RUN_TIMEOUT_SECONDS``，默认 900s）。
+
+    必须 **大于** 因子子进程自己的 600s 上限：那条路超时会先触发并做完进程组
+    回收与终态收口；本上限只兜「卡在取数/求值里、连子进程都没起来」的情况，
+    保证无论卡在哪都有终态、去重位都能释放。
+    """
+    return _env_int("QM_BACKTEST_RUN_TIMEOUT_SECONDS", 900)
+
+
 # ── 文件面侦察（provider 布局读取，皆为 KiB 级元数据 IO）────────────────
 
 

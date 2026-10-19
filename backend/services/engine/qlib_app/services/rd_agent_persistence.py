@@ -362,6 +362,107 @@ class RDAgentFactorPersistence:
                 return None
             return _decode_metadata(dict(r))
 
+    async def delete_factor(self, factor_id: str, *, user_id: str) -> bool:
+        """Delete a factor and its factor-scoped database history atomically."""
+        async with get_session() as session:
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT status FROM rd_agent_factors "
+                        "WHERE factor_id = :factor_id AND user_id = :user_id "
+                        "FOR UPDATE"
+                    ),
+                    {"factor_id": factor_id, "user_id": user_id},
+                )
+            ).first()
+            if row is None:
+                return False
+            if str(row[0] or "") == "backtesting":
+                raise ValueError("running_backtest")
+
+            active_run = (
+                await session.execute(
+                    text(
+                        "SELECT 1 FROM rd_agent_factor_backtests "
+                        "WHERE factor_id = :factor_id AND status = 'running' "
+                        "AND finished_at IS NULL LIMIT 1"
+                    ),
+                    {"factor_id": factor_id},
+                )
+            ).first()
+            if active_run is not None:
+                raise ValueError("running_backtest")
+
+            # Pool tables have independent lifecycles on older installations, so
+            # only clean them when they exist. All operations remain in this txn.
+            from backend.shared.factor_pool_contract import (
+                COMBOS_TABLE,
+                EDGES_TABLE,
+                POOL_TABLE,
+            )
+
+            existing_tables = set(
+                (
+                    await session.execute(
+                        text(
+                            "SELECT unnest(ARRAY["
+                            "to_regclass(:pool_table)::text, "
+                            "to_regclass(:edges_table)::text, "
+                            "to_regclass(:combos_table)::text])"
+                        ),
+                        {
+                            "pool_table": POOL_TABLE,
+                            "edges_table": EDGES_TABLE,
+                            "combos_table": COMBOS_TABLE,
+                        },
+                    )
+                ).scalars().all()
+            )
+            if EDGES_TABLE in existing_tables:
+                await session.execute(
+                    text(
+                        f"DELETE FROM {EDGES_TABLE} WHERE user_id = :user_id "
+                        "AND (src_factor_id = :factor_id OR dst_factor_id = :factor_id)"
+                    ),
+                    {"factor_id": factor_id, "user_id": user_id},
+                )
+            if COMBOS_TABLE in existing_tables:
+                await session.execute(
+                    text(
+                        f"DELETE FROM {COMBOS_TABLE} WHERE user_id = :user_id "
+                        "AND factor_ids @> CAST(:factor_ids AS JSONB)"
+                    ),
+                    {
+                        "factor_ids": json.dumps([factor_id]),
+                        "user_id": user_id,
+                    },
+                )
+            if POOL_TABLE in existing_tables:
+                await session.execute(
+                    text(
+                        f"DELETE FROM {POOL_TABLE} "
+                        "WHERE factor_id = :factor_id AND user_id = :user_id"
+                    ),
+                    {"factor_id": factor_id, "user_id": user_id},
+                )
+
+            await session.execute(
+                text(
+                    "DELETE FROM rd_agent_factor_backtests "
+                    "WHERE factor_id = :factor_id"
+                ),
+                {"factor_id": factor_id},
+            )
+            result = await session.execute(
+                text(
+                    "DELETE FROM rd_agent_factors "
+                    "WHERE factor_id = :factor_id AND user_id = :user_id "
+                    "RETURNING factor_id"
+                ),
+                {"factor_id": factor_id, "user_id": user_id},
+            )
+            return result.fetchone() is not None
+
     async def update_factor_names_cn(self, names: dict[str, str]) -> int:
         """批量补充中文显示名；不会改写原始名称或因子身份。"""
         if not names:

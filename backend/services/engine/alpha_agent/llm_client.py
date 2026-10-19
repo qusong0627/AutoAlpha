@@ -116,9 +116,18 @@ class LLMConfig:
         （子进程继承了 os.environ），这样「只在个人中心换 embedding 模型、沿用
         容器里的 key/base」也能生效。
         """
+        # The runner receives the selected OPENAI_* credentials. Route compatible
+        # endpoints through that provider instead of requiring a second vendor key.
+        litellm_model = self.model
+        if self.protocol == "openai":
+            if litellm_model.startswith("deepseek/"):
+                litellm_model = litellm_model.removeprefix("deepseek/")
+            if not litellm_model.startswith(("openai/", "azure/", "anthropic/", "huggingface/")):
+                litellm_model = f"openai/{litellm_model}"
         env = {
             "LITELLM_OPENAI_API_KEY": self.api_key,
             "LITELLM_OPENAI_API_BASE": self.base_url,
+            "LITELLM_CHAT_MODEL": litellm_model,
             "OPENAI_API_KEY": self.api_key,
             "OPENAI_BASE_URL": self.base_url,
             "CHAT_MODEL": self.model,

@@ -1,7 +1,7 @@
 """存量因子代码迁移 shim —— 旧 ``daily_pv.h5`` 读法 → QuantDB 取数（H5 退役）.
 
 旧挖出因子代码里的 ``pd.read_hdf('daily_pv.h5', key='data')`` 无法在新执行环境
-复算。本模块在执行前做无损正则迁移（参考 superalpha 同名模块）：
+复算。AutoAlpha 在执行前做无损正则迁移：
 
 * ``pd.read_hdf('daily_pv.h5', key='data')`` → ``qd.panel()``（同形
   MultiIndex[datetime, instrument] + ``$`` 前缀列，语义零变化）；

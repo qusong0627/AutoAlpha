@@ -1,16 +1,77 @@
 import { useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { Alert, App, Button, Input, InputNumber, Modal, Segmented, Select, Table, Tag } from 'antd';
-import { BarChart3 } from 'lucide-react';
+import { Activity, BarChart3 } from 'lucide-react';
 import { ALPHA, dateTime, errorText, factorDisplayName, get, isActive, number, post, request, universeName, universeNames, type Factor, type Row, type Run } from './api';
 import { useResource, useStored } from './hooks';
 import { CurveChart, EmptyState, JsonDetails, LoadState, MetricGrid, Page, Panel, Refresh, SpecPanel, Status } from './ui';
+
+/** 已用时文案：<1 分钟按秒，其余 m 分 s 秒（进度容器每秒刷新）。 */
+function elapsedText(from: string | undefined, now: number) {
+  if (!from) return '—';
+  const started = new Date(from).getTime();
+  if (!Number.isFinite(started)) return '—';
+  const seconds = Math.max(0, Math.floor((now - started) / 1000));
+  if (seconds < 60) return `${seconds} 秒`;
+  return `${Math.floor(seconds / 60)} 分 ${String(seconds % 60).padStart(2, '0')} 秒`;
+}
+
+/** 单笔回测的常规用时（实测 34~40s）；超过它的仍在跑，给一句「还在跑」的提示。 */
+const SLOW_RUN_SECONDS = 120;
+
+/** 回测进度容器：口径与台账之间的实时视图（单跑=不定态进度条+已用时，批次=真实完成比例）。 */
+function BacktestProgress({ runs, batch, batchId, now, busy, nameOf, onCancel, onCancelBatch }: {
+  runs: Run[]; batch?: Row; batchId: string; now: number; busy: string;
+  nameOf: (factorId: string, fallback?: string) => string;
+  onCancel: () => void; onCancelBatch: () => void;
+}) {
+  const active = runs.filter(run => isActive(run.status));
+  const progress = (batch?.progress || {}) as Row;
+  // 只看「还没收口」的批次：已完成的批次留在下方「批量任务」里，不长期占着进度位
+  const batchActive = Boolean(batchId && progress.total && isActive(batch?.batch?.status));
+  const total = Number(progress.total || 0);
+  const done = Number(progress.done || 0);
+  const percent = total ? Math.round((done / total) * 100) : 0;
+  const current = (progress.current || []) as Row[];
+  const idle = !active.length && !batchActive;
+  return <Panel title="回测进度" extra={idle ? undefined : <span className="progress-live"><i />实时刷新 · 5s</span>}>
+    {batchActive && <div className="progress-board" style={{ marginBottom: active.length ? 10 : 0 }}>
+      <article className="progress-row batch">
+        <div className="progress-meter">
+          <div className="progress-top"><div><strong>批量回测 · {total} 个单元</strong><div className="subtle">批次 {batchId} · {progress.draining ? '串行排水进行中' : '已停止排水'}</div></div><div className="actions"><Status value={batch?.batch?.status} /><Button size="small" danger loading={busy === 'cancel'} onClick={onCancelBatch}>取消该批次</Button></div></div>
+          <div className="progress-bar" role="progressbar" aria-label="批量回测完成比例" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}><span style={{ width: `${percent}%` }} /></div>
+          <div className="progress-stats">
+            <span><b>{done}</b>/{total} 已完成</span><span><b>{progress.running || 0}</b> 运行中</span><span><b>{progress.failed || 0}</b> 失败</span><span><b>{progress.pending || 0}</b> 待跑</span>
+            <span className="progress-pct">{percent}%</span>
+          </div>
+          {current.length > 0 && <div className="progress-current">{current.map(unit => <span className="progress-chip" key={`${unit.factor_id}-${unit.market}`}>{nameOf(String(unit.factor_id))} · {universeName(unit.market)}</span>)}</div>}
+        </div>
+      </article>
+    </div>}
+    {active.length > 0 && <div className="progress-board">{active.map(run => <article className="progress-row" key={run.run_id}>
+      <div className="progress-main">
+        <strong>{nameOf(run.factor_id, run.factor_name)}</strong>
+        <span className="subtle">{run.date_range || '窗口待后端确认'} · {universeName(run.universe)} · 日频</span>
+      </div>
+      <div className="progress-meter">
+        <div className="progress-bar indeterminate" role="progressbar" aria-label="单因子回测进行中" aria-valuetext="进行中（无百分比）"><span /></div>
+        <span className="progress-meta">
+          <Status value={run.status} />
+          <span>已用时 {elapsedText(run.created_at, now)}</span>
+          {run.created_at && (now - new Date(run.created_at).getTime()) / 1000 > SLOW_RUN_SECONDS && <span className="progress-note">已超过常规用时，仍在运行</span>}
+        </span>
+      </div>
+      <div className="actions"><Button size="small" danger loading={busy === 'cancel'} onClick={onCancel}>取消</Button></div>
+    </article>)}</div>}
+    {idle && <div className="progress-idle"><span className="progress-idle-icon"><Activity size={16} /></span><strong>当前没有进行中的回测</strong><div className="subtle">提交后这里会实时显示状态与已用时，收口结果随后进入下方台账。</div></div>}
+  </Panel>;
+}
 
 export default function BacktestPage() {
   const { message } = App.useApp(); const [params, setParams] = useSearchParams();
   const [factorId, setFactorId] = useState(params.get('factorId') || ''); const [factorIds, setFactorIds] = useState(params.get('factorIds')?.split(',').filter(Boolean) || []);
   const [mode, setMode] = useState(params.get('factorIds') ? 'batch' : 'single');
-  const [config, setConfig] = useStored('autoalpha.backtest-config', { universe: 'csi300', start: '', end: '', cost_bps: 20 });
+  const [config, setConfig] = useStored('autoalpha.backtest-config', { universe: 'csi500', start: '', end: '', cost_bps: 20 });
   const [busy, setBusy] = useState(''); const [review, setReview] = useState<Row>(); const [batchId, setBatchId] = useState(params.get('batchId') || ''); const [receipt, setReceipt] = useState<Row>();
   const factors = useResource(signal => get<{ factors: Factor[] }>(`${ALPHA}/factors`, { limit: 500 }, signal));
   useEffect(() => { if (!factorId && factors.data?.factors.length) setFactorId(factors.data.factors[0].factor_id); }, [factors.data]);
@@ -18,6 +79,16 @@ export default function BacktestPage() {
   const runs = useResource(signal => get<{ runs: Run[] }>(`/factor-backtest/runs`, { factor_id: factorId, limit: 100 }, signal), [factorId], 5000, Boolean(factorId));
   const batches = useResource(signal => get<Row>('/factor-backtest/batches', { limit: 20 }, signal), [], 15000);
   const batch = useResource(signal => get<Row>('/factor-backtest/batch/status', { batch_id: batchId }, signal), [batchId], 5000, Boolean(batchId));
+  const activeRuns = (runs.data?.runs || []).filter(run => isActive(run.status));
+  const batchActive = Boolean(batch.data?.progress?.total && isActive(batch.data?.batch?.status));
+  // 进度容器里的「已用时」每秒走一格；空闲时不起定时器（不做无用的重渲染）。
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!activeRuns.length && !batchActive) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [activeRuns.length, batchActive]);
+  const nameOf = (id: string, fallback?: string) => { const factor = factors.data?.factors.find(f => f.factor_id === id); return factor ? factorDisplayName(factor) : fallback || id; };
   const selectedRun = runs.data?.runs.find(run => run.run_id === params.get('runId')) || runs.data?.runs[0];
   const selectedId = selectedRun?.run_id;
   const series = useResource(signal => get<Row>(`/factor-backtest/runs/${selectedId}/series`, undefined, signal), [selectedId], 0, Boolean(selectedId && selectedRun?.has_series));
@@ -51,6 +122,7 @@ export default function BacktestPage() {
       ['交易成本', `${config.cost_bps} bps`, '换手成本口径', '#f59e0b'],
       ['频率', '日频', 'A 股日频数据', '#a855f7'],
     ]} />
+    <BacktestProgress runs={runs.data?.runs || []} batch={batch.data} batchId={batchId} now={now} busy={busy} nameOf={nameOf} onCancel={() => cancel()} onCancelBatch={() => cancel(true)} />
     <Panel title="回测台账"><LoadState resource={runs}>{runs.data?.runs.length ? <Table rowKey="run_id" dataSource={runs.data.runs} scroll={{ x: 900 }} pagination={{ pageSize: 8, showSizeChanger: false }} columns={[
       { title: '窗口 / 股票池', render: (_, run) => <div><div>{run.date_range || '等待执行'}</div><div className="item-description">{universeName(run.universe)}</div></div> }, { title: '状态', render: (_, run) => <Status value={run.status} /> }, { title: 'IC', render: (_, run) => number(run.ic_value) }, { title: 'Rank IC', render: (_, run) => number(run.rank_ic) }, { title: '夏普', render: (_, run) => number(run.sharpe_ratio) }, { title: '扣费夏普', render: (_, run) => number(run.metrics?.sharpe_net) }, { title: '创建时间', render: (_, run) => dateTime(run.created_at) }, { title: '操作', render: (_, run) => <Button type="link" onClick={() => setParams({ factorId, runId: run.run_id })}>查看报告</Button> },
     ]} /> : <EmptyState title="该因子尚无回测记录" description="提交独立回测后，运行台账与结果将在这里显示。" />}</LoadState></Panel>

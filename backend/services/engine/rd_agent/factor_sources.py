@@ -1,6 +1,6 @@
 """因子数据溯源：从因子代码静态提取数据依赖（H5 退役后的 QuantDB 契约）。
 
-参考 superalpha ``scan_source_datasets``：平台解析后记入
+AutoAlpha 解析因子代码中的数据集依赖后记入
 ``metadata.sourceDatasets`` / 回测台账 ``params``，多年后重跑可知当初算的是
 哪几份数据。规则：
 

@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import stat
 import subprocess
@@ -17,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from pathlib import Path
@@ -762,6 +764,68 @@ async def _require_owned_task(task_id: str, request: Request) -> dict:
     if not status or status.get("user_id") != auth_user_id:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
     return status
+
+
+def _quarantine_task_log_dir(task_id: str) -> Path | None:
+    """Atomically move a task log tree aside before its database row is removed."""
+    from backend.services.engine.alpha_agent.trajectory_store import resolve_task_log_dir
+
+    task_dir = resolve_task_log_dir(task_id)
+    root = task_dir.parent.resolve()
+    if task_dir.resolve(strict=False).parent != root:
+        raise ValueError("unsafe_task_log_path")
+    if task_dir.is_symlink():
+        raise ValueError("task_log_symlink_refused")
+    if not task_dir.exists():
+        return None
+    if not task_dir.is_dir():
+        raise ValueError("task_log_path_not_directory")
+    quarantine = task_dir.with_name(f".{task_id}.delete-{uuid.uuid4().hex}")
+    task_dir.rename(quarantine)
+    return quarantine
+
+
+def _quarantine_factor_panel(factor: Mapping[str, Any]) -> Path | None:
+    """Move the factor's private pool panel aside, validating every path segment."""
+    from backend.services.engine.mining_plugins.pool_panels import panel_path, panel_root
+
+    factor_id = str(factor.get("factor_id") or "")
+    market = str(factor.get("market") or "a_share")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", factor_id):
+        raise ValueError("unsafe_factor_id")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", market):
+        raise ValueError("unsafe_factor_market")
+    root = panel_root().resolve()
+    path = panel_path(market, factor_id)
+    parent = path.parent.resolve()
+    if parent != root / market or not parent.is_relative_to(root):
+        raise ValueError("unsafe_factor_panel_path")
+    if not os.path.lexists(path):
+        return None
+    if path.is_dir() and not path.is_symlink():
+        raise ValueError("factor_panel_path_not_file")
+    quarantine = path.with_name(f".{factor_id}.delete-{uuid.uuid4().hex}")
+    path.rename(quarantine)
+    return quarantine
+
+
+def _restore_quarantined_path(original: Path, quarantined: Path | None) -> None:
+    if quarantined is not None and os.path.lexists(quarantined):
+        quarantined.rename(original)
+
+
+def _remove_quarantined_path(path: Path | None) -> bool:
+    if path is None:
+        return True
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+        return True
+    except OSError:
+        logger.exception("Failed to remove quarantined local artifact %s", path)
+        return False
 
 
 async def _require_owned_factor(
@@ -1904,12 +1968,65 @@ async def cancel_task(task_id: str, request: Request):
     return {"code": 200, "data": {"task_id": task_id, "status": "cancelled"}}
 
 
+@router.delete("/tasks/{task_id}")
+async def delete_task(task_id: str, request: Request):
+    """Delete a terminal task row and its local task log/workspace directory."""
+    user_id, _ = get_authenticated_identity(request)
+    store = get_mining_task_store()
+    task = await store.get_task(task_id, user_id=user_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    if task.get("status") not in {"completed", "failed", "cancelled"}:
+        raise HTTPException(
+            status_code=409,
+            detail="任务仍在运行或排队，请先取消并等待任务结束后再删除",
+        )
+    live = await get_launcher().get_task_status(task_id)
+    if live and live.get("status") in {"pending", "queued", "running"}:
+        raise HTTPException(
+            status_code=409,
+            detail="任务仍在运行或排队，请先取消并等待任务结束后再删除",
+        )
+
+    from backend.services.engine.alpha_agent.trajectory_store import resolve_task_log_dir
+
+    try:
+        task_dir = resolve_task_log_dir(task_id)
+        quarantined = await asyncio.to_thread(_quarantine_task_log_dir, task_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="任务本地目录路径无效，拒绝删除") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="无法暂存任务本地文件") from exc
+
+    try:
+        deleted = await store.delete_terminal_task(task_id, user_id=user_id)
+    except Exception as exc:
+        await asyncio.to_thread(_restore_quarantined_path, task_dir, quarantined)
+        logger.exception("Failed to delete task row %s", task_id)
+        raise HTTPException(status_code=500, detail="删除任务记录失败，已恢复本地文件") from exc
+    if not deleted:
+        await asyncio.to_thread(_restore_quarantined_path, task_dir, quarantined)
+        raise HTTPException(status_code=409, detail="任务状态已变化，请刷新后重试")
+
+    get_launcher().forget_terminal_task(task_id)
+    files_deleted = await asyncio.to_thread(_remove_quarantined_path, quarantined)
+    return {
+        "code": 200,
+        "data": {
+            "task_id": task_id,
+            "database_deleted": True,
+            "local_files_deleted": files_deleted,
+            "generated_factors_preserved": True,
+        },
+    }
+
+
 @router.get("/tasks/{task_id}/log")
 async def get_task_log(
     task_id: str,
     request: Request,
     tail: int = Query(500, ge=1, le=5000, description="返回行数"),
-    offset: int = Query(0, ge=0, description="从第N行开始返回（0-based）"),
+    offset: int | None = Query(None, ge=0, description="从第N行开始返回（0-based）；不传则读取最新日志"),
 ):
     """获取任务的详细子进程日志（分页读取）"""
     await _require_owned_task(task_id, request)
@@ -1919,15 +2036,16 @@ async def get_task_log(
         raise HTTPException(status_code=404, detail=f"Task {task_id} log not found")
     all_lines = log_content.splitlines()
     total = len(all_lines)
-    # offset-based slicing: return lines[offset:offset+tail]
-    end = min(offset + tail, total)
-    lines = all_lines[offset:end]
+    start = max(0, total - tail) if offset is None else offset
+    end = min(start + tail, total)
+    lines = all_lines[start:end]
     return {
         "code": 200,
         "data": {
             "task_id": task_id,
             "lines": lines,
             "total": total,
+            "offset": start,
         },
     }
 
@@ -2577,6 +2695,51 @@ async def get_factor(factor_id: str, request: Request):
     """获取单个因子详情（附六维标签与生命周期视图，T-FE-06/07）"""
     factor = await _require_owned_factor(factor_id, request)
     return {"code": 200, "data": (await _decorate_factor_rows([factor]))[0]}
+
+
+@router.delete("/factors/{factor_id}")
+async def delete_factor(factor_id: str, request: Request):
+    """Delete a factor, its DB history, and its private pool-panel cache file."""
+    factor = await _require_owned_factor(factor_id, request, for_write=True)
+    if factor_id in _running_backtests:
+        raise HTTPException(status_code=409, detail="因子正在回测，请结束后再删除")
+    user_id, _ = get_authenticated_identity(request)
+
+    try:
+        from backend.services.engine.mining_plugins.pool_panels import panel_path
+
+        panel = panel_path(str(factor.get("market") or "a_share"), factor_id)
+        quarantined = await asyncio.to_thread(_quarantine_factor_panel, factor)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="因子本地文件路径无效，拒绝删除") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="无法暂存因子本地文件") from exc
+
+    try:
+        deleted = await persistence.delete_factor(factor_id, user_id=user_id)
+    except ValueError as exc:
+        await asyncio.to_thread(_restore_quarantined_path, panel, quarantined)
+        if str(exc) == "running_backtest":
+            raise HTTPException(status_code=409, detail="因子正在回测，请结束后再删除") from exc
+        raise
+    except Exception as exc:
+        await asyncio.to_thread(_restore_quarantined_path, panel, quarantined)
+        logger.exception("Failed to delete factor %s", factor_id)
+        raise HTTPException(status_code=500, detail="删除因子数据库记录失败，已恢复本地文件") from exc
+    if not deleted:
+        await asyncio.to_thread(_restore_quarantined_path, panel, quarantined)
+        raise HTTPException(status_code=404, detail=f"Factor {factor_id} not found")
+
+    files_deleted = await asyncio.to_thread(_remove_quarantined_path, quarantined)
+    return {
+        "code": 200,
+        "data": {
+            "factor_id": factor_id,
+            "database_deleted": True,
+            "local_files_deleted": files_deleted,
+            "shared_materialized_values_preserved": True,
+        },
+    }
 
 
 @router.get("/metrics/registry")
@@ -4922,7 +5085,7 @@ def _deploy_quantdb_sdk(run_dir: str) -> str:
     """把 ``quantdb_data.py`` 下发到因子执行目录（软链→复制兜底），返回目标路径。
 
     子进程脚本 ``sys.path.insert(0, run_dir)`` 后，因子代码
-    ``import quantdb_data as qd`` 即可用（参考 superalpha 执行器）。
+    ``import quantdb_data as qd`` 即可使用 AutoAlpha 的统一取数入口。
     """
     import shutil as _shutil
 
@@ -5075,6 +5238,14 @@ async def _run_functional_factor_subprocess(
     Path(os.path.join(run_dir, "result.parquet")).unlink(missing_ok=True)
     Path(os.path.join(run_dir, "result.h5")).unlink(missing_ok=True)
 
+    # 因子代码自己定位产物路径时用的锚（挖掘侧因子常写
+    # ``os.path.dirname(os.path.abspath(__file__))``）。挖掘链路把因子代码落成
+    # 任务目录里的真实脚本文件再执行，``__file__`` 天然存在；回测这条是 exec 一段
+    # 字符串，命名空间里没有 ``__file__``，这类因子在收尾写 result.parquet 时直接
+    # ``NameError``（因子算完却拿不到结果）。按挖掘侧同一语义给它一个 run_dir 下的
+    # 脚本路径：dirname(abspath(__file__)) == run_dir == 子进程 cwd。
+    factor_file = os.path.join(run_dir, "factor.py")
+
     script = f"""
 import pandas as pd
 import numpy as np
@@ -5092,7 +5263,9 @@ try:
     # 未产出 result，则显式调用 calculate_*()」）。子进程 exec 的命名空间里没有
     # __name__，守卫取到的是 'builtins' 而不是 '__main__'，main() 根本不触发，
     # 于是自执行因子统统掉进下面的零参调用——线上 6 个因子卡在这（2026-10-07）。
-    _factor_ns = {{"__name__": "__main__"}}
+    # __file__ 同理必须补：它是因子代码定位「自己所在目录」的唯一锚，
+    # 与挖掘侧（因子落成脚本文件后执行）语义一致，指向本 run_dir。
+    _factor_ns = {{"__name__": "__main__", "__file__": {factor_file!r}}}
     exec({repr(exec_code)}, _factor_ns)
 
     def _produced():
@@ -5196,7 +5369,10 @@ import numpy as np
 import sys, os, traceback
 
 try:
-    _factor_ns = {{}}
+    # 补 __file__：因子代码用 dirname(abspath(__file__)) 定位自己的目录时不再
+    # NameError（与功能性因子同一契约，见 _run_functional_factor_subprocess）。
+    # 仍不给 __name__：这里是 Factor 类路径，包一层 __main__ 会误触因子内的自执行块。
+    _factor_ns = {{"__file__": {os.path.join(_run_dir, "factor.py")!r}}}
     exec({repr(factor_code)}, _factor_ns)
     _factor_cls = None
     for _v in _factor_ns.values():
@@ -5220,7 +5396,10 @@ try:
             continue
     if not _pieces:
         print("NO_PIECES"); sys.exit(1)
-    pd.concat(_pieces).to_parquet({out_path!r}, engine="pyarrow", compression="zstd")
+    # pd.concat(list[Series]) 仍是 Series，而 Series 没有 to_parquet（须先 to_frame，
+    # 这是因子代码契约里写明的同一条规矩）。缺这一步时任何 Factor 类因子都在收尾
+    # 抛 'Series' object has no attribute 'to_parquet'，回测必然失败。
+    pd.concat(_pieces).to_frame("f").to_parquet({out_path!r}, engine="pyarrow", compression="zstd")
     print("FACTOR_DONE")
 except Exception:
     with open({tb_path!r}, "w") as _f:
@@ -5454,7 +5633,9 @@ import sys, os, tempfile, traceback
 os.chdir({str(run_dir)!r})
 try:
     # 用 exec 定义因子函数（__name__ != __main__，不触发 main 块），再调用 calculate_* 执行
-    _factor_ns = {{}}
+    # __file__ 指向本次工作目录下的因子脚本路径：因子用 dirname(abspath(__file__))
+    # 定位产物时与挖掘侧同解（同 _run_functional_factor_subprocess）。
+    _factor_ns = {{"__file__": {str(run_dir / "factor.py")!r}}}
     exec({repr(factor_code)}, _factor_ns)
     _calc_fns = [v for k, v in _factor_ns.items() if k.startswith("calculate_") and callable(v)]
     if not _calc_fns:

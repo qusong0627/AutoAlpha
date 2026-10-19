@@ -1,4 +1,4 @@
-"""Panel parquet 缓存 —— H5 退役后的因子基础面板（参考 superalpha 同名模块）。
+"""AutoAlpha Panel parquet 缓存 —— H5 退役后的因子基础面板。
 
 形态：``<data_root>/.panel_cache/daily_pv.parquet`` 单文件，索引内嵌
 ``MultiIndex[datetime, instrument]``（instrument 为 qlib 小写格式 ``sh600036``），
@@ -10,7 +10,7 @@
 - 剔除前复权收盘 <= 0 的行（高分红股多年除权后 qfq 价转负）；
 - 窗口自 ``PANEL_START``（2020-01-01）起。
 
-与 superalpha 的差异：本模块经既有 ``QuantDBDataHub``（DuckDB 精确分区直读）
+AutoAlpha 经既有 ``QuantDBDataHub``（DuckDB 精确分区直读）
 构建，不引入 ``quantdb-sdk`` 新依赖；富化列（技术指标/估值/L2 等）不在面板内，
 因子代码经 ``quantdb_data.daily()`` 按需读取。
 

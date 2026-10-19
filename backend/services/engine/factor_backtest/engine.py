@@ -134,12 +134,21 @@ def _qlib_provider_and_region(qlib_market: str) -> tuple[str, str]:
 
 
 def _ensure_qlib(qlib_market: str) -> None:
-    """幂等 qlib.init（region 口径与旧实现一致）；失败只告警。"""
+    """幂等 qlib.init（region 口径与旧实现一致）；失败只告警。
+
+    **kernels 必须钉成 1**。qlib 的 ``D.features`` 会按 ``C.kernels``（默认
+    ``NUM_USABLE_CPU``，本机 34）用 ``joblib_backend="multiprocessing"``（fork）
+    逐标的并行读（qlib/data/data.py:577）。回测引擎是 250+ 线程的异步进程，
+    这次调用又发生在 ``asyncio.to_thread`` 的工作线程里——在多线程进程的非主线程
+    fork，会偶发把 worker 卡死在 futex 上，表现为「D.features 永不返回」：run 永远
+    停在 running、去重位不释放（2026-10-19 实测；同一份数据在单线程进程里读只要
+    2.0s）。串行读全市场 3 年 7 列实测 2~6s，用这点时间换掉一个会挂死的并发池。
+    """
     import qlib
 
     provider_uri, region = _qlib_provider_and_region(qlib_market)
     try:
-        qlib.init(provider_uri=provider_uri, region=region)
+        qlib.init(provider_uri=provider_uri, region=region, kernels=1)
     except Exception as e:  # noqa: BLE001 — 重复 init 快速返回；真失败由后续取数暴露
         logger.warning("qlib.init(%s) raised: %s", provider_uri, e)
 
@@ -149,6 +158,28 @@ def _load_features(instruments, fields, start: str, end: str) -> pd.DataFrame:
     from qlib.data import D
 
     return D.features(instruments, fields, start_time=start, end_time=end, freq="day")
+
+
+async def _bounded_thread(fn, *args, timeout_s: float):
+    """同步重活放线程并加等待上限（超时抛 ``asyncio.TimeoutError``，由调用方翻译成终态）。
+
+    线程本身无法被打断（底层 IO 卡住只能等它自然返回），但**协程**能立刻解脱：
+    这条路径存在的意义就是不把「取数卡住」传染给 run 的生命周期。
+    """
+    return await asyncio.wait_for(asyncio.to_thread(fn, *args), timeout=timeout_s)
+
+
+def _universe_desc(universe_value: str | None, instruments) -> str:
+    """池子规模的诊断文案。qlib 的 instrument 配置是 dict（两个键），
+    不是股票清单——直接 ``len()`` 会输出「2 只」这种误导性数字。"""
+    size: int | None = None
+    if not isinstance(instruments, dict):
+        try:
+            size = len(instruments)
+        except TypeError:
+            size = None
+    label = str(universe_value or "default")
+    return f"{label}({size} 只)" if size is not None else label
 
 
 def _liquid_top_n(qlib_market: str, top_n: int, end: str) -> list[str]:
@@ -224,6 +255,8 @@ async def evaluate_factor_market(
     factor_id = str(factor.get("factor_id") or "")
     code = str(factor.get("factor_code") or "")
     universe_value = universe or profile.default_universe
+    # 取数等待上限（env 可调）：卡住也必须给终态，绝不留 running 行
+    data_timeout = profiles_mod.effective_data_timeout_s()
 
     base = {
         "factor_id": factor_id,
@@ -310,9 +343,23 @@ async def evaluate_factor_market(
 
     # ⑥ universe 解析（HK 动态流动性池 / 其余走既有池解析，CN 缺省 csi300）
     if profile.universe_mode == "liquid_top_n":
-        instruments = await asyncio.to_thread(
-            _liquid_top_n, profile.qlib_market, effective_universe_top_n(profile), end
-        )
+        try:
+            instruments = await _bounded_thread(
+                _liquid_top_n,
+                profile.qlib_market,
+                effective_universe_top_n(profile),
+                end,
+                timeout_s=data_timeout,
+            )
+        except asyncio.TimeoutError:
+            return _finish(
+                _result(
+                    base,
+                    "failed",
+                    reason="data_timeout",
+                    message=f"动态流动性池取数超时（>{data_timeout}s）",
+                )
+            )
         base["universe_size"] = len(instruments)
         if not instruments:
             return _finish(
@@ -326,9 +373,29 @@ async def evaluate_factor_market(
         )
 
     # ⑦ 行情装载（冷读 bin：必须 to_thread，否则看门狗把 engine 强杀）
-    df = await asyncio.to_thread(
-        _load_features, instruments, _FEATURE_FIELDS, start, end
-    )
+    #    并必须带上限：装机读卡住时，无上限的等待等于把 run 永远钉在 running。
+    try:
+        df = await _bounded_thread(
+            _load_features,
+            instruments,
+            _FEATURE_FIELDS,
+            start,
+            end,
+            timeout_s=data_timeout,
+        )
+    except asyncio.TimeoutError:
+        return _finish(
+            _result(
+                base,
+                "failed",
+                reason="data_timeout",
+                message=(
+                    f"Qlib 行情装载超时（>{data_timeout}s）: "
+                    f"market={market} window={start}~{end} "
+                    f"universe={_universe_desc(universe_value, instruments)}"
+                ),
+            )
+        )
     if df is None or df.empty:
         return _finish(
             _result(
@@ -437,9 +504,21 @@ async def evaluate_factor_market(
     #     （parquet 读取是同步重活，走 to_thread 防看门狗强杀）。
     bench_label = "equal_weight"
     if profile.benchmark != "equal_weight":
-        bench_ret = await asyncio.to_thread(
-            load_benchmark_returns, profile.benchmark, curves.index
-        )
+        # 基准读取超时不算 run 失败：退回等权兜底，只是口径降级（与读数失败同待遇）
+        try:
+            bench_ret = await _bounded_thread(
+                load_benchmark_returns,
+                profile.benchmark,
+                curves.index,
+                timeout_s=data_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[factor-backtest] 基准 %s 装载超时（>%ss），退回等权",
+                profile.benchmark,
+                data_timeout,
+            )
+            bench_ret = None
         if bench_ret is not None:
             curves = curves.copy()
             curves["bench"] = bench_ret

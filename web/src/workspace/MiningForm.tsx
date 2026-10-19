@@ -10,7 +10,7 @@ import { useWorkspace } from './WorkspaceContext';
 export interface MiningDraft { algorithm: string; algorithm_preference_saved?: boolean; datasets_preference_saved?: boolean; universe: string; direction: string; freq: string; loop_n: number; mining_start: string; mining_end: string; valid_start: string; valid_end: string; datasets: string[]; validation: boolean; quality_gate_mode: string; data_source?: string; }
 export const DRAFT_KEY = 'autoalpha.mining-draft';
 const CONFIG_KEY = 'autoalpha.mining-config';
-export const initialDraft = (): MiningDraft => ({ algorithm: 'rdagent', universe: localStorage.getItem('qm.preset.universe') || 'csi300', direction: '', freq: 'day', loop_n: 5, mining_start: '', mining_end: '', valid_start: '', valid_end: '', datasets: [], validation: true, quality_gate_mode: 'soft', data_source: 'parquet' });
+export const initialDraft = (): MiningDraft => ({ algorithm: 'rdagent', universe: localStorage.getItem('qm.preset.universe') || 'csi500', direction: '', freq: 'day', loop_n: 5, mining_start: '', mining_end: '', valid_start: '', valid_end: '', datasets: [], validation: true, quality_gate_mode: 'soft', data_source: 'parquet' });
 
 const MARKETS = [
   { key: 'a_share', label: 'A股', enabled: true },

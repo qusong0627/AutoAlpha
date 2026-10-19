@@ -37,7 +37,7 @@ def build_llm_env(env: dict[str, Any]) -> dict[str, Any]:
     """在现有 env 基础上补齐 litellm 需要的 LITELLM_ + OPENAI_ 变量。
 
     API key 优先级：DEEPSEEK_API_KEY（非占位） > LITELLM_OPENAI_API_KEY > AI_IDE_LLM_API_KEY > AI_IDE_API_KEY > OPENAI_API_KEY
-    模型优先级：   DEEPSEEK（若 deepseek key 生效） > CHAT_MODEL
+    模型优先级：   已解析的 LITELLM_CHAT_MODEL > DEEPSEEK（若 key 生效） > CHAT_MODEL
     """
     deepseek_key = (
         os.getenv("DEEPSEEK_API_KEY", "").strip()
@@ -74,8 +74,15 @@ def build_llm_env(env: dict[str, Any]) -> dict[str, Any]:
         or os.getenv("OPENAI_API_BASE", "").strip()
     )
 
-    # Chat model：deepseek 优先
-    if deepseek_key:
+    # The selected model must survive removal of vendor credentials from runner
+    # environments. Re-running this function in RDLoopWrapper must not replace
+    # LITELLM_CHAT_MODEL with an unrelated default after DEEPSEEK_API_KEY is stripped.
+    selected_model = env.get("LITELLM_CHAT_MODEL", "").strip()
+    if selected_model:
+        chat_model = selected_model
+        if not chat_model.startswith(("openai/", "azure/", "anthropic/", "huggingface/", "deepseek/")):
+            chat_model = f"{'deepseek' if deepseek_key else 'openai'}/{chat_model}"
+    elif deepseek_key:
         deepseek_model = (
             env.get("DEEPSEEK_MODEL", "").strip()
             or os.getenv("DEEPSEEK_MODEL", "").strip()
@@ -100,17 +107,14 @@ def build_llm_env(env: dict[str, Any]) -> dict[str, Any]:
         env["LITELLM_OPENAI_API_BASE"] = litellm_base
     if chat_model:
         env["LITELLM_CHAT_MODEL"] = chat_model
-
-    # ---- 写入标准 OPENAI_（litellm HTTP 层 + 兼容旧路径）----
-    # 当用 deepseek 时，必须覆盖 OPENAI_API_KEY/BASE，否则 litellm 会用讯飞的 key 打 deepseek
-    if deepseek_key:
-        env["OPENAI_API_KEY"] = deepseek_key
-        env["OPENAI_BASE_URL"] = deepseek_base
         env["CHAT_MODEL"] = chat_model
-    elif litellm_key and not env.get("OPENAI_API_KEY"):
+        env["REASONING_MODEL"] = chat_model
+
+    # Keep both settings readers on the same resolved credential and endpoint.
+    if litellm_key:
         env["OPENAI_API_KEY"] = litellm_key
-        if litellm_base and not env.get("OPENAI_BASE_URL"):
-            env["OPENAI_BASE_URL"] = litellm_base
+    if litellm_base:
+        env["OPENAI_BASE_URL"] = litellm_base
 
     return env
 
