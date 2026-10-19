@@ -4,7 +4,7 @@
 
 - **执行/对齐/IC 口径全部复用** ``alpha_agent`` 现成实现（import 不改旧码）：
   子进程隔离执行、因子-价格对齐、挖掘同源富化 h5、取消机制（共享
-  ``_backtest_processes``/``_backtest_cancelled``，按 factor_id 取消）。
+  ``_backtest_processes``/``_backtest_cancelled``，由路由按 run_id 精确取消）。
 - 本模块只负责**装配与裁决**：市场档案 → universe 解析 → 数据装载 →
   状态机（ok/data_unsupported/insufficient/unavailable/failed）→ 指标与
   序列（``ic.py``）。
@@ -14,8 +14,8 @@
 修复的一处旧缺陷：旧 qlib 路径 fields 只有 6 列（缺 ``$amount``），17 条
 金额档因子在非 CN 必挂——本引擎 fields 带上 ``$amount``（五市场 bin 实测同构）。
 
-并发纪律：子进程登记按 factor_id 键，**同一因子不得跨市场并发**——矩阵/批量
-引擎逐市场串行循环同一因子（路由层用 ``_running_backtests`` 去重兜底）。
+并发纪律：路由按 factor_id 做运行去重，子进程句柄按 run_id 登记；取消后旧 run
+的延迟清理不能移除新 run 的句柄。矩阵/批量引擎逐市场串行循环同一因子。
 """
 
 from __future__ import annotations

@@ -13,33 +13,14 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from backend.services.engine.alpha_agent.factor_naming import generate_factor_names_cn
-from backend.services.engine.qlib_app.services.rd_agent_persistence import (
-    RDAgentFactorPersistence,
+from backend.shared.secret_redaction import install_secret_redaction
+from backend.services.engine.alpha_agent.factor_naming import (
+    name_task_factors_cn,
 )
 
 
 async def _run(task_id: str, user_id: str) -> int:
-    persistence = RDAgentFactorPersistence()
-    await persistence.ensure_tables()
-    factors = await persistence.list_factors(
-        user_id=user_id,
-        task_id=task_id,
-        limit=500,
-    )
-    candidates = []
-    for factor in factors:
-        metadata = factor.get("metadata") or {}
-        candidates.append({
-            "factor_id": factor.get("factor_id"),
-            "factor_name": factor.get("factor_name"),
-            "factor_formulation": factor.get("factor_formulation"),
-            "description": metadata.get("description") or metadata.get("formulation"),
-        })
-    names = await generate_factor_names_cn(candidates)
-    saved = await persistence.update_factor_names_cn(names)
-    logging.info("task=%s factors=%d generated=%d saved=%d", task_id, len(candidates), len(names), saved)
-    return saved
+    return await name_task_factors_cn(task_id, user_id)
 
 
 def main() -> int:
@@ -48,6 +29,7 @@ def main() -> int:
     parser.add_argument("--user-id", required=True)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    install_secret_redaction()
     try:
         asyncio.run(_run(args.task_id, args.user_id))
         return 0

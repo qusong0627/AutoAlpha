@@ -43,13 +43,35 @@ logger = logging.getLogger(__name__)
 DEFAULT_HISTORY_LIMIT = 50
 MAX_HISTORY_LIMIT = 200
 MAX_DIRECTION_CHARS = 20000
-try:
-    TASK_LEASE_SECONDS = max(120, int(os.getenv("ALPHA_TASK_LEASE_SECONDS", "180")))
-except ValueError:
-    TASK_LEASE_SECONDS = 180
+MIN_TASK_LEASE_SECONDS = 120
+MAX_TASK_LEASE_SECONDS = 3600
+
+
+def _resolve_task_lease_seconds(raw: str | None) -> int:
+    try:
+        configured = int(raw) if raw is not None else 180
+    except ValueError:
+        logger.warning("invalid ALPHA_TASK_LEASE_SECONDS; using default")
+        return 180
+    bounded = min(
+        MAX_TASK_LEASE_SECONDS,
+        max(MIN_TASK_LEASE_SECONDS, configured),
+    )
+    if bounded != configured:
+        logger.warning("ALPHA_TASK_LEASE_SECONDS outside allowed range; clamped")
+    return bounded
+
+
+TASK_LEASE_SECONDS = _resolve_task_lease_seconds(
+    os.getenv("ALPHA_TASK_LEASE_SECONDS")
+)
 # A fresh identity per backend process. Tasks and heartbeats are owned by the
 # process that holds their in-memory execution state; a restart gets a new ID.
 TASK_OWNER_ID = str(uuid.uuid4())
+
+
+class TaskLeaseLostError(RuntimeError):
+    """Raised when this process no longer owns an active persisted task row."""
 
 #: 单文档任务明细（T-FM-19b 一文档多方向）的返回上限；真实总数另走
 #: :meth:`MiningTaskStore.count_tasks_by_docs`——明细截断时界面靠它报「共 N 个」，
@@ -482,13 +504,14 @@ class MiningTaskStore:
             )
         now = utc_now()
         async with get_session() as session:
-            await session.execute(
+            result = await session.execute(
                 text("""
                     UPDATE rd_agent_mining_tasks
                     SET status = :status, progress_pct = :pct, current_loop = :loop,
                         updated_at = :now, lease_expires_at = :lease_expires_at
                     WHERE task_id = :task_id AND owner_id = :owner_id
                       AND status IN ('pending', 'queued', 'running')
+                    RETURNING task_id
                     """),
                 {
                     "status": status,
@@ -500,6 +523,22 @@ class MiningTaskStore:
                     "task_id": task_id,
                 },
             )
+            if result.fetchone() is None:
+                row = (
+                    await session.execute(
+                        text(
+                            "SELECT owner_id, status FROM rd_agent_mining_tasks "
+                            "WHERE task_id = :task_id"
+                        ),
+                        {"task_id": task_id},
+                    )
+                ).first()
+                if row is not None and (
+                    row[0] != TASK_OWNER_ID or row[1] not in ACTIVE_STATUSES
+                ):
+                    raise TaskLeaseLostError(
+                        f"Mining task {task_id} is no longer owned by this process"
+                    )
 
     async def mark_terminal(
         self,
@@ -795,7 +834,7 @@ class MiningTaskStore:
             "UPDATE rd_agent_mining_tasks "
             "SET status = 'failed', "
             "    error = COALESCE(error, 'Task owner lease expired'), "
-            "    completed_at = :now, updated_at = :now "
+            "    completed_at = :now, updated_at = :now, lease_expires_at = NULL "
             "WHERE status IN ('pending', 'queued', 'running') "
             "AND (lease_expires_at < :lease_expired "
             "     OR (lease_expires_at IS NULL AND updated_at < :legacy_stale_before))"

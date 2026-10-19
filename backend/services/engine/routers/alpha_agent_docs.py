@@ -96,7 +96,7 @@ from pathlib import Path, PurePosixPath
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from starlette.datastructures import UploadFile
+from starlette.datastructures import FormData, UploadFile
 
 from backend.services.engine.alpha_agent.doc_credentials import (
     resolve_effective_mineru_config,
@@ -732,7 +732,19 @@ async def upload_doc(request: Request) -> dict:
     except RateLimited as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
     _enforce_upload_content_length(request)
-    form = await request.form()
+    # 在 Starlette 开始解析并将文件部分写入临时目录前限制部件数；
+    # 下面的业务校验仍保留，用于给出稳定的 API 错误和校验字段名。
+    form = await request.form(max_files=MAX_DOC_FILES, max_fields=0)
+    try:
+        return await _handle_upload_doc_form(form, user_id, tenant_id)
+    finally:
+        # request.form() 是手动解析的；显式关闭 Starlette 暂存文件，不依赖 GC。
+        await request.close()
+
+
+async def _handle_upload_doc_form(
+    form: FormData, user_id: str, tenant_id: str | None
+) -> dict:
     raw_files = form.getlist("file")
     # 比对的必须是 starlette.datastructures.UploadFile：request.form() 产出的
     # 文件对象是 starlette 类，不是它的子类 fastapi.UploadFile——比子类会让
@@ -753,17 +765,16 @@ async def upload_doc(request: Request) -> dict:
 
     store = get_doc_store()
     svc = get_doc_parse_service()
-    # 通道预检走「有效配置」口径（因子挖掘设置 > env）：没配就别收文件——
-    # 先收再发现不可用会留下永远解析不了的孤儿。
+    # 通道预检只使用部署环境配置：没配就别收文件——先收再发现不可用
+    # 会留下永远解析不了的孤儿。
     effective_cfg, _cfg_src = await resolve_effective_mineru_config(user_id, tenant_id)
     if effective_cfg is None:
         raise HTTPException(
             status_code=503,
             detail=(
                 "文档解析服务未就绪：未配置 MinerU 解析通道。"
-                "请在「因子挖掘 → 文档解析设置」配置 MinerU API Token"
-                "（或本地/局域网 MinerU 服务地址），"
-                "或在服务器 .env 配置 MINERU_API_TOKEN / MINERU_LOCAL_URL。"
+                "请在受保护的部署环境中配置 MINERU_API_TOKEN，"
+                "或配置 MINERU_LOCAL_URL（按需设置 MINERU_LOCAL_API_KEY），然后重启后端。"
             ),
         )
 
@@ -774,6 +785,7 @@ async def upload_doc(request: Request) -> dict:
         parts, sizes, sha256 = await _store_uploaded_files(
             raw_files, filenames, exts, doc_dir
         )
+        await form.close()
     except HTTPException:
         shutil.rmtree(doc_dir, ignore_errors=True)
         raise

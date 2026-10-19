@@ -4,18 +4,23 @@
 """
 
 import asyncio
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import logging
 import os
 import re
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Annotated, Any, Optional
 from urllib.parse import urlsplit
 
 if TYPE_CHECKING:  # pandas 在函数内按需 import；这里只为字符串注解提供名字
@@ -229,14 +234,36 @@ def _resolve_custom_pool_instruments(universe: str) -> list[str] | None:
 
 
 _running_backtests: set[str] = set()
-# 回测子进程句柄 + 取消标记：cancel 接口据此真正 kill 子进程
+# 回测子进程按 run_id 登记；旧式调用无 run_id 时仍以 factor_id 作键。
 _backtest_processes: dict[str, subprocess.Popen] = {}
+_backtest_process_keys: dict[str, str] = {}
 _backtest_cancelled: set[str] = set()
 # 本进程内「因子 → 当前未完结运行的 run_id」注册表：历史台账按 run_id 精确收口。
 # 不用「最新未完结行」启发式——取消会先放行去重闸（允许立即重跑），旧任务延迟
 # 收尾时若按「最新」找行，会把**新任务**的行收错（真结果永久丢失）；按 run_id
 # 收口后旧任务对自己的行幂等无操作，新任务不受影响。
 _running_backtest_runs: dict[str, str | None] = {}
+_backtest_run_context: ContextVar[tuple[str, str] | None] = ContextVar(
+    "alpha_backtest_run_context", default=None
+)
+
+
+@contextmanager
+def backtest_run_scope(factor_id: str, run_id: str):
+    """Carry the ledger run identity through engine helpers to subprocess spawn."""
+    token = _backtest_run_context.set((factor_id, run_id))
+    try:
+        yield
+    finally:
+        _backtest_run_context.reset(token)
+
+
+def get_backtest_process(
+    factor_id: str, run_id: str | None = None
+) -> subprocess.Popen | None:
+    """Return only the process belonging to this run, with legacy fallback."""
+    key = run_id or _backtest_process_keys.get(factor_id) or factor_id
+    return _backtest_processes.get(key)
 
 
 def environment_embedding_overrides() -> dict:
@@ -376,6 +403,112 @@ def _new_factor_workspace(prefix: str) -> str:
     return str(path)
 
 
+def _remove_factor_workspace(run_dir: str) -> None:
+    """Remove a private factor workspace, including dirs made unreadable by code."""
+    import shutil
+
+    root = Path(run_dir)
+    try:
+        if root.is_symlink() or not root.is_dir():
+            raise OSError("workspace root is no longer a directory")
+        # Untrusted code can chmod directories inside its writable mount and
+        # otherwise make rmtree fail. The child has exited before this runs;
+        # restore owner access without following any symlink before removal.
+        os.chmod(root, 0o700, follow_symlinks=False)
+        for current, directories, _files in os.walk(root, followlinks=False):
+            for name in directories:
+                child = Path(current) / name
+                if not child.is_symlink():
+                    os.chmod(child, 0o700, follow_symlinks=False)
+        shutil.rmtree(root)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:  # cleanup must not mask a result or cancellation
+        logger.warning(
+            "factor sandbox workspace cleanup failed (%s)",
+            type(exc).__name__,
+        )
+
+
+def _factor_workspace(prefix: str):
+    """Give a factor subprocess helper a private workspace and always remove it."""
+    from functools import wraps
+
+    def decorate(func):
+        @wraps(func)
+        async def run(factor_id: str, *args, **kwargs):
+            run_dir = _new_factor_workspace(prefix=f"{prefix}_{factor_id[:8]}_")
+            try:
+                return await func(factor_id, *args, _run_dir=run_dir, **kwargs)
+            finally:
+                _remove_factor_workspace(run_dir)
+
+        return run
+
+    return decorate
+
+
+def _read_workspace_tail(path: str, workspace: str, *, max_bytes: int = 64 * 1024) -> str:
+    """Read a bounded tail from a regular file directly inside a factor workspace."""
+    root = Path(workspace).absolute()
+    candidate = Path(path).absolute()
+    if candidate.parent != root or candidate.name in {"", ".", ".."}:
+        return ""
+
+    directory_fd = None
+    file_fd = None
+    try:
+        directory_fd = os.open(
+            root,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        file_fd = os.open(
+            candidate.name,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=directory_fd,
+        )
+        info = os.fstat(file_fd)
+        if not stat.S_ISREG(info.st_mode):
+            return ""
+        os.lseek(file_fd, max(0, info.st_size - max_bytes), os.SEEK_SET)
+        return os.read(file_fd, max_bytes).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _workspace_regular_file(
+    path: str,
+    workspace: str,
+    *,
+    max_bytes: int = 512 * 1024 * 1024,
+) -> Path:
+    """Validate an untrusted factor output before a parent-process parser opens it."""
+    root = Path(workspace).absolute()
+    candidate = Path(path).absolute()
+    if candidate.parent != root or root.is_symlink() or not root.is_dir():
+        raise RuntimeError("因子结果路径不在本次工作目录内")
+    try:
+        info = candidate.lstat()
+    except OSError as exc:
+        raise RuntimeError("因子结果文件不存在") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise RuntimeError("因子结果必须是普通文件")
+    if info.st_size > max_bytes:
+        raise RuntimeError("因子结果文件超过大小限制")
+    return candidate
+
+
 def _factor_sandbox_command(
     args: list[str], env: dict[str, str], workspace_dirs: Sequence[str]
 ) -> list[str]:
@@ -487,24 +620,138 @@ async def _run_subprocess_tracked(
         sandboxed_args,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
         env=child_env,
+        start_new_session=True,
     )
-    _backtest_processes[factor_id] = proc
-    try:
+    run_context = _backtest_run_context.get()
+    process_key = (
+        run_context[1]
+        if run_context is not None and run_context[0] == factor_id
+        else factor_id
+    )
+    _backtest_processes[process_key] = proc
+    _backtest_process_keys[factor_id] = process_key
+    capture_limit = 256 * 1024
+    captured: dict[str, bytes] = {}
+    readers: list[tuple[threading.Thread, Any]] = []
+
+    def _drain_pipe(name: str, stream) -> None:
+        tail = bytearray()
+        read_chunk = getattr(stream, "read1", stream.read)
         try:
-            stdout, stderr = await asyncio.to_thread(proc.communicate, timeout=timeout)
+            while True:
+                chunk = read_chunk(64 * 1024)
+                if not chunk:
+                    break
+                tail.extend(chunk)
+                if len(tail) > capture_limit:
+                    del tail[: len(tail) - capture_limit]
+        except OSError:
+            pass
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+            captured[name] = bytes(tail)
+
+    try:
+        readers = [
+            (
+                threading.Thread(
+                    target=_drain_pipe, args=("stdout", proc.stdout), daemon=True
+                ),
+                proc.stdout,
+            ),
+            (
+                threading.Thread(
+                    target=_drain_pipe, args=("stderr", proc.stderr), daemon=True
+                ),
+                proc.stderr,
+            ),
+        ]
+        for reader, _stream in readers:
+            reader.start()
+        try:
+            await asyncio.to_thread(proc.wait, timeout=timeout)
+            # A factor can exit after spawning a same-process-group child that
+            # still holds stdout/stderr open. Reap that group before joining the
+            # pipe readers so normal completion cannot hang or leak workers.
+            await terminate_backtest_process(proc, grace_seconds=0)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = await asyncio.to_thread(proc.communicate)
+            await terminate_backtest_process(proc, grace_seconds=0)
             raise RuntimeError(
                 f"因子计算超时（>{int(timeout)}s），子进程已终止"
             ) from None
+        except BaseException:
+            await terminate_backtest_process(proc, grace_seconds=0)
+            raise
+        for reader, _stream in readers:
+            await asyncio.to_thread(reader.join)
         if factor_id in _backtest_cancelled:
             raise FactorBacktestCancelled("回测已被用户取消")
-        return proc.returncode, stdout or "", stderr or ""
+        return (
+            proc.returncode,
+            captured.get("stdout", b"").decode("utf-8", errors="replace"),
+            captured.get("stderr", b"").decode("utf-8", errors="replace"),
+        )
     finally:
-        _backtest_processes.pop(factor_id, None)
+        if proc.poll() is None:
+            await terminate_backtest_process(proc, grace_seconds=0)
+        for reader, stream in readers:
+            if reader.ident is not None:
+                await asyncio.to_thread(reader.join)
+            else:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        if _backtest_processes.get(process_key) is proc:
+            _backtest_processes.pop(process_key, None)
+        if _backtest_process_keys.get(factor_id) == process_key:
+            _backtest_process_keys.pop(factor_id, None)
+
+
+async def terminate_backtest_process(
+    proc: subprocess.Popen,
+    *,
+    grace_seconds: float = 2.0,
+) -> None:
+    """Terminate a tracked bubblewrap process group without blocking the loop."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError:
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return
+
+    if grace_seconds > 0 and proc.poll() is None:
+        deadline = time.monotonic() + grace_seconds
+        while proc.poll() is None and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+    try:
+        # Also target the group after its leader exited: descendants may remain
+        # and retain the captured pipe descriptors.
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+    if proc.poll() is None:
+        await asyncio.to_thread(proc.wait)
 
 
 async def _require_owned_task(task_id: str, request: Request) -> dict:
@@ -2046,7 +2293,9 @@ async def get_direction_quota(
 
 
 class FactorMaterializeRequest(BaseModel):
-    factor_ids: list[str]
+    factor_ids: list[Annotated[str, Field(min_length=1, max_length=128)]] = Field(
+        ..., min_length=1, max_length=100
+    )
     force: bool = False
 
 
@@ -2695,8 +2944,8 @@ def _spawn_recovery_batch(coro) -> None:
 async def backtest_factor(
     factor_id: str,
     request: Request,
-    start_date: str | None = None,
-    end_date: str | None = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
     universe: str | None = Query(
         "csi300",
         description="回测股票池: csi300, csi500, csi1000, sse50, gem, star, csi800, all_a",
@@ -2711,6 +2960,9 @@ async def backtest_factor(
     data_source=h5: 走 RD-Agent daily_pv.h5（A股/港股/美股有预生成，期货从 parquet 自动生成，crypto 预生成）。
     """
     factor = await _require_owned_factor(factor_id, request, for_write=True)
+
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(status_code=422, detail="开始日期不能晚于结束日期")
 
     if not factor.get("factor_code"):
         raise HTTPException(status_code=400, detail="因子代码为空，无法回测")
@@ -2742,8 +2994,8 @@ async def backtest_factor(
             factor.get("factor_code") or "",
             market=market,
             data_source=data_source or "qlib_bin",
-            start_date=start_date,
-            end_date=end_date,
+            start_date=start_date.isoformat() if start_date else None,
+            end_date=end_date.isoformat() if end_date else None,
             universe=universe or "csi300",
             run_id=run_id,
         )
@@ -2773,21 +3025,12 @@ async def cancel_backtest(factor_id: str, request: Request):
             },
         }
     _backtest_cancelled.add(factor_id)
-    proc = _backtest_processes.get(factor_id)
+    proc = get_backtest_process(
+        factor_id, _running_backtest_runs.get(factor_id)
+    )
     if proc and proc.poll() is None:
         try:
-            proc.terminate()
-            for _ in range(10):
-                if proc.poll() is not None:
-                    break
-                await asyncio.sleep(0.2)
-            if proc.poll() is None:
-                proc.kill()
-                logger.warning(
-                    "[alpha-backtest] force-killed subprocess for %s", factor_id
-                )
-        except ProcessLookupError:
-            pass
+            await terminate_backtest_process(proc)
         except Exception as e:
             logger.warning("[alpha-backtest] cancel kill %s failed: %s", factor_id, e)
     try:
@@ -3459,7 +3702,9 @@ async def get_pool_refresh_status(request: Request):
 
 
 class PoolArchiveRequest(BaseModel):
-    factor_ids: list[str] = Field(..., min_length=1, max_length=500)
+    factor_ids: list[Annotated[str, Field(min_length=1, max_length=128)]] = Field(
+        ..., min_length=1, max_length=500
+    )
 
 
 @router.get("/pool/cleanup/suggestions")
@@ -3516,11 +3761,13 @@ async def post_pool_cleanup_unarchive(request: Request, body: PoolArchiveRequest
 
 
 class ComboOptimizeRequest(BaseModel):
-    market: str = "a_share"
+    market: str = Field("a_share", max_length=32)
     # universe 最长 64（安全 M-1：此前原样入库无上限，一行可塞任意大字符串）
     universe: str = Field("", max_length=64)
-    factor_ids: list[str]
-    name: str = ""
+    factor_ids: list[Annotated[str, Field(min_length=1, max_length=128)]] = Field(
+        ..., min_length=1, max_length=200
+    )
+    name: str = Field("", max_length=128)
     seed: int | None = None
 
 
@@ -4763,11 +5010,14 @@ def _write_mining_panel(src: str | None, dest_panel: str, df) -> None:
     panel_df.to_parquet(dest_panel, engine="pyarrow", compression="zstd")
 
 
+@_factor_workspace("bt")
 async def _run_functional_factor_subprocess(
     factor_id: str,
     factor_code: str,
     df: "pd.DataFrame",
     source_panel: str | None = None,
+    *,
+    _run_dir: str,
 ) -> "pd.Series | None":
     """对 RD-Agent 函数式因子：用 subprocess 跑（隔离错误），主进程读 result.parquet。
 
@@ -4800,7 +5050,7 @@ async def _run_functional_factor_subprocess(
 
     import pandas as _pd  # 只在回退分支的层序归位用（模块级刻意不引 pandas）
 
-    run_dir = _new_factor_workspace(prefix=f"bt_{factor_id[:8]}_")
+    run_dir = _run_dir
     panel_file = os.path.join(run_dir, "panel.parquet")
     try:
         _write_mining_panel(source_panel, panel_file, df)
@@ -4886,7 +5136,7 @@ except Exception as e:
         workspace_dirs=(run_dir,),
     )
     if returncode != 0:
-        tb = Path(tb_path).read_text() if Path(tb_path).exists() else ""
+        tb = _read_workspace_tail(tb_path, run_dir)
         out = stdout + "\n" + stderr
         raise RuntimeError(
             f"因子执行失败 (exit={returncode}): {out[-300:]}\n{tb[-1000:]}"
@@ -4897,12 +5147,16 @@ except Exception as e:
         import pandas as _pd
 
         if Path(out_path).exists():
-            result_df = _pd.read_parquet(out_path)
+            safe_result_path = _workspace_regular_file(out_path, run_dir)
+            result_df = _pd.read_parquet(safe_result_path)
         else:
             _legacy = [f for f in os.listdir(run_dir) if f.endswith(".h5")]
             if not _legacy:
                 raise RuntimeError("无结果文件")
-            result_df = _pd.read_hdf(os.path.join(run_dir, _legacy[0]))
+            legacy_path = _workspace_regular_file(
+                os.path.join(run_dir, _legacy[0]), run_dir
+            )
+            result_df = _pd.read_hdf(legacy_path)
     except Exception as e:
         raise RuntimeError(f"读取因子结果失败: {e}") from e
 
@@ -4911,15 +5165,20 @@ except Exception as e:
     return _canonicalize_factor_series(result_df)
 
 
+@_factor_workspace("factor")
 async def _run_factor_class_subprocess(
-    factor_id: str, factor_code: str, df: "pd.DataFrame"
+    factor_id: str,
+    factor_code: str,
+    df: "pd.DataFrame",
+    *,
+    _run_dir: str,
 ) -> "pd.Series | None":
     """Qlib Factor 类因子：subprocess 隔离执行（逐股调用），主进程只读结果。
 
     因子代码由 LLM 生成或用户提交，绝不能在 engine 主进程 exec。
     每次运行用独立的临时文件，避免并发回测相互覆盖。
     """
-    run_dir = _new_factor_workspace(prefix=f"factor_{factor_id[:8]}_")
+    run_dir = _run_dir
     input_path = os.path.join(run_dir, "input.parquet")
     out_path = os.path.join(run_dir, "result.parquet")
     tb_path = os.path.join(run_dir, "traceback.txt")
@@ -4975,7 +5234,7 @@ except Exception:
         workspace_dirs=(run_dir,),
     )
     if returncode != 0:
-        tb = Path(tb_path).read_text() if Path(tb_path).exists() else ""
+        tb = _read_workspace_tail(tb_path, run_dir)
         raise RuntimeError(
             f"因子执行失败 (exit={returncode}): {((stdout or '') + stderr)[-300:]}\n{tb[-1000:]}"
         )
@@ -4983,7 +5242,8 @@ except Exception:
     try:
         import pandas as _pd
 
-        result_df = _pd.read_parquet(out_path)
+        safe_result_path = _workspace_regular_file(out_path, run_dir)
+        result_df = _pd.read_parquet(safe_result_path)
     except Exception as e:
         raise RuntimeError(f"读取因子结果失败: {e}") from e
 
@@ -4997,6 +5257,7 @@ except Exception:
     return _canonicalize_multiindex(s)
 
 
+@_factor_workspace("expr")
 async def _run_expression_factor_subprocess(
     factor_id: str,
     expression: str,
@@ -5005,6 +5266,8 @@ async def _run_expression_factor_subprocess(
     instruments,
     start: str,
     end: str,
+    *,
+    _run_dir: str,
 ) -> "pd.Series | None":
     """qlib 表达式因子（统计派）：subprocess 内 qlib 原生求值，主进程只读结果。
 
@@ -5033,7 +5296,7 @@ async def _run_expression_factor_subprocess(
         FM_CODE_PREFIX,
     )
 
-    run_dir = _new_factor_workspace(prefix=f"expr_{factor_id[:8]}_")
+    run_dir = _run_dir
     out_path = os.path.join(run_dir, "result.parquet")
     tb_path = os.path.join(run_dir, "traceback.txt")
 
@@ -5093,7 +5356,7 @@ except Exception as _e:
         workspace_dirs=(run_dir,),
     )
     if returncode != 0:
-        tb = Path(tb_path).read_text() if Path(tb_path).exists() else ""
+        tb = _read_workspace_tail(tb_path, str(run_dir))
         raise RuntimeError(
             f"表达式因子执行失败 (exit={returncode}): {((stdout or '') + stderr)[-300:]}\n{tb[-1000:]}"
         )
@@ -5101,7 +5364,8 @@ except Exception as _e:
     try:
         import pandas as _pd
 
-        result_df = _pd.read_parquet(out_path)
+        safe_result_path = _workspace_regular_file(out_path, run_dir)
+        result_df = _pd.read_parquet(safe_result_path)
     except Exception as e:
         raise RuntimeError(f"读取表达式结果失败: {e}") from e
 

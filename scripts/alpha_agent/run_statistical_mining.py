@@ -734,13 +734,6 @@ def main() -> None:
             task_fingerprint=task_fingerprint,
         )
     )
-    if persisted + persisted_composite:
-        from backend.services.engine.alpha_agent.factor_naming import (
-            spawn_task_factor_naming,
-        )
-
-        spawn_task_factor_naming(args.task_id, args.user_id, log_dir)
-
     rejected = [r for r in result.candidates if not r.selected]
     logger.info(
         "候选 %d：入选 %d，落库 %d，合成落库 %d",

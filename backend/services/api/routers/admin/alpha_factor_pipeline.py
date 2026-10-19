@@ -12,11 +12,13 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import multiprocessing
 import os
 import re
+import threading
 import uuid
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import BrokenExecutor, ProcessPoolExecutor
 from typing import Annotated, Any, Optional
 
 import numpy as np
@@ -69,6 +71,11 @@ class PromoteResponse(BaseModel):
     promoted: list[dict[str, Any]]
     errors: list[dict[str, Any]]
     auto_train_triggered: bool = False
+
+
+AUTO_TRAIN_UNAVAILABLE_MESSAGE = (
+    "因子已推广，但当前独立部署未接入训练 API；请手动启动训练。"
+)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -160,28 +167,57 @@ def _is_qlib_expression(expr: str) -> bool:
 
 
 def _sanitize_feature_key(name: str) -> str:
-    """将因子名转为合法的 feature_key。"""
-    key = re.sub(r'[^a-zA-Z0-9_]', '_', name).lower().strip('_')
-    key = re.sub(r'_+', '_', key)
-    return f"alpha_{key}"[:80]
+    """将因子名转为合法且稳定的 feature_key，避免有损清洗造成覆盖。"""
+    normalized = (name or "").strip()
+    key = re.sub(r"[^a-zA-Z0-9_]", "_", normalized).lower().strip("_")
+    key = re.sub(r"_+", "_", key)
+    prefix = "alpha_"
+
+    # Preserve legacy keys for ordinary short ASCII names. Punctuation, whitespace,
+    # non-ASCII names, underscore normalization, and truncation are lossy; append a
+    # stable digest so distinct names cannot silently upsert into the same feature.
+    lossy = key != normalized.lower() or len(prefix) + len(key) > 80
+    suffix = ""
+    if lossy:
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+        suffix = f"_{digest}"
+    if not key:
+        key = "factor"
+        if not suffix:
+            digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+            suffix = f"_{digest}"
+
+    max_key_length = 80 - len(prefix) - len(suffix)
+    key = key[:max_key_length].rstrip("_") or "factor"
+    return f"{prefix}{key}{suffix}"
 
 
-def _env_int(name: str, default: int) -> int:
-    """读正整数环境变量；非法/缺失/非正数一律回落到 default。"""
+def _env_int(name: str, default: int, *, max_value: int) -> int:
+    """读正整数环境变量并施加代码级上限；非法/缺失/非正数回落 default。"""
     try:
         value = int(str(os.getenv(name, "")).strip())
     except (TypeError, ValueError):
         return default
-    return value if value > 0 else default
+    if value <= 0:
+        return default
+    if value > max_value:
+        logger.warning("%s 超过代码上限 %d，已截断", name, max_value)
+        return max_value
+    return value
 
 
-def _env_float(name: str, default: float) -> float:
-    """读正浮点环境变量；非法/缺失/非正数一律回落到 default。"""
+def _env_float(name: str, default: float, *, max_value: float) -> float:
+    """读有限正浮点环境变量并施加上限；非法/缺失/非正数回落 default。"""
     try:
         value = float(str(os.getenv(name, "")).strip())
     except (TypeError, ValueError):
         return default
-    return value if value > 0 else default
+    if not math.isfinite(value) or value <= 0:
+        return default
+    if value > max_value:
+        logger.warning("%s 超过代码上限 %.0f，已截断", name, max_value)
+        return max_value
+    return value
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -206,7 +242,7 @@ def _ensure_qlib_init():
         qlib.init(
             provider_uri=QLIB_PROVIDER_URI,
             region="cn",
-            kernels=_env_int("QLIB_KERNELS", 4),
+            kernels=_env_int("QLIB_KERNELS", 4, max_value=4),
         )
         _qlib_initialized = True
         logger.info(
@@ -221,6 +257,10 @@ def _ensure_qlib_init():
 
 def compute_factor_via_qlib(expression: str, feature_name: str) -> pd.DataFrame:
     """用 Qlib 引擎计算因子表达式，返回 MultiIndex(date, instrument) DataFrame。"""
+    # Qlib's parser evaluates expressions. Keep validation at this execution sink
+    # as well as at HTTP boundaries so internal callers cannot bypass the DSL.
+    if not _is_qlib_expression(expression):
+        raise ValueError("非法 Qlib 表达式")
     _ensure_qlib_init()
     from qlib.data import D
 
@@ -243,9 +283,14 @@ def compute_factor_via_qlib(expression: str, feature_name: str) -> pd.DataFrame:
 #   v2 进程池（当前）：计算与落盘都在子进程，父进程只收一个小 dict。
 #   用 spawn 而非 fork：fork 会让子进程继承父进程的 asyncio/asyncpg 连接状态，
 #   子进程退出时的资源清理可能破坏父进程的数据库连接。
-_PROMOTE_MAX_CONCURRENCY = _env_int("FACTOR_PROMOTE_MAX_CONCURRENCY", 2)
-_PROMOTE_TIMEOUT_SECONDS = _env_float("FACTOR_PROMOTE_TIMEOUT_SECONDS", 180.0)
+_PROMOTE_MAX_CONCURRENCY = _env_int(
+    "FACTOR_PROMOTE_MAX_CONCURRENCY", 2, max_value=4
+)
+_PROMOTE_TIMEOUT_SECONDS = _env_float(
+    "FACTOR_PROMOTE_TIMEOUT_SECONDS", 180.0, max_value=1800.0
+)
 _PROMOTE_EXECUTOR: Optional[ProcessPoolExecutor] = None
+_PROMOTE_RESET_LOCK = threading.Lock()
 _PROMOTE_WORKER_ENV_KEYS = (
     "PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "TZ",
     "QLIB_PROVIDER_URI", "QLIB_KERNELS", "QM_QUANTDB_DATA_DIR",
@@ -288,14 +333,13 @@ def _promote_executor() -> ProcessPoolExecutor:
     return _PROMOTE_EXECUTOR
 
 
-def _reset_promote_executor() -> None:
-    """超时后终止旧池的 worker，再重建进程池，避免遗留计算持续占资源。"""
-    global _PROMOTE_EXECUTOR
-    if _PROMOTE_EXECUTOR is not None:
-        executor = _PROMOTE_EXECUTOR
-        # ProcessPoolExecutor 没有公开的 per-task 强制取消 API。超时意味着该池
-        # 已不可信，终止整池 worker，避免每次超时后留下仍在运行的孤儿进程。
-        workers = list(getattr(executor, "_processes", {}).values())
+def _terminate_promote_executor(executor: ProcessPoolExecutor) -> None:
+    """Terminate and shut down a failed pool; this blocking cleanup runs off-loop."""
+    with _PROMOTE_RESET_LOCK:
+        # ProcessPoolExecutor has no public per-task hard-cancel API. A timed-out pool
+        # is untrusted, so terminate every worker to avoid orphaned computations.
+        worker_map = getattr(executor, "_processes", None) or {}
+        workers = list(worker_map.values())
         for process in workers:
             try:
                 if process.is_alive():
@@ -312,12 +356,27 @@ def _reset_promote_executor() -> None:
                 logger.warning("回收超时因子 worker 失败", exc_info=True)
         try:
             executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:  # noqa: BLE001 - 重建失败也不能让请求挂在这里
-            pass
+        except Exception:  # noqa: BLE001 - best-effort shutdown
+            logger.warning("关闭失效因子 worker 池失败", exc_info=True)
+
+
+async def _reset_promote_executor(executor: ProcessPoolExecutor) -> None:
+    """Detach only the failed pool, then terminate it without blocking the event loop."""
+    global _PROMOTE_EXECUTOR
+    if _PROMOTE_EXECUTOR is executor:
         _PROMOTE_EXECUTOR = None
+    await asyncio.to_thread(_terminate_promote_executor, executor)
 
 
 _PROMOTE_SLOTS = asyncio.Semaphore(_PROMOTE_MAX_CONCURRENCY)
+
+
+async def _watch_promote_future_deadline(future: Any, executor: ProcessPoolExecutor) -> None:
+    """Enforce the compute deadline even if the HTTP request is cancelled."""
+    await asyncio.sleep(_PROMOTE_TIMEOUT_SECONDS)
+    if not future.done() and _PROMOTE_EXECUTOR is executor:
+        logger.warning("因子计算超过硬超时；后台重置对应 worker 池")
+        await _reset_promote_executor(executor)
 
 
 async def _promote_offloop(expression: str, feature_name: str) -> dict:
@@ -330,14 +389,35 @@ async def _promote_offloop(expression: str, feature_name: str) -> dict:
             detail="因子计算任务已达并发上限，请稍后重试。",
         ) from exc
 
+    future = None
+    timeout_watchdog: asyncio.Task[None] | None = None
+    loop = asyncio.get_running_loop()
     try:
-        future = _promote_executor().submit(_promote_in_child, expression, feature_name)
+        executor = _promote_executor()
+        try:
+            future = executor.submit(_promote_in_child, expression, feature_name)
+        except BrokenExecutor as exc:
+            await _reset_promote_executor(executor)
+            raise HTTPException(
+                status_code=503,
+                detail="因子计算 worker 池不可用，已重置，请稍后重试。",
+            ) from exc
+        timeout_watchdog = asyncio.create_task(
+            _watch_promote_future_deadline(future, executor),
+            name="factor-promotion-hard-timeout",
+        )
+        wrapped_future = asyncio.wrap_future(future)
+        wrapped_future.add_done_callback(
+            lambda completed: completed.exception()
+            if not completed.cancelled()
+            else None
+        )
         try:
             return await asyncio.wait_for(
-                asyncio.wrap_future(future), timeout=_PROMOTE_TIMEOUT_SECONDS
+                asyncio.shield(wrapped_future), timeout=_PROMOTE_TIMEOUT_SECONDS
             )
         except asyncio.TimeoutError as exc:
-            _reset_promote_executor()
+            await _reset_promote_executor(executor)
             raise HTTPException(
                 status_code=504,
                 detail=(
@@ -345,8 +425,33 @@ async def _promote_offloop(expression: str, feature_name: str) -> dict:
                     f"超时 worker 已终止，并发上限 {_PROMOTE_MAX_CONCURRENCY}。"
                 ),
             ) from exc
+        except BrokenExecutor as exc:
+            await _reset_promote_executor(executor)
+            raise HTTPException(
+                status_code=503,
+                detail="因子计算 worker 异常退出，进程池已重置，请稍后重试。",
+            ) from exc
     finally:
-        _PROMOTE_SLOTS.release()
+        if future is None:
+            _PROMOTE_SLOTS.release()
+        else:
+            # Request cancellation only cancels its shield; a running ProcessPool job
+            # cannot be cancelled that way. Hold the capacity slot until the
+            # underlying process future finishes. The watchdog survives disconnects
+            # and still enforces the hard deadline.
+            def release_slot_when_done(_completed_future) -> None:
+                def release_on_loop() -> None:
+                    _PROMOTE_SLOTS.release()
+                    if timeout_watchdog is not None and not timeout_watchdog.done():
+                        timeout_watchdog.cancel()
+
+                try:
+                    loop.call_soon_threadsafe(release_on_loop)
+                except RuntimeError:
+                    # The event loop is already closing; no requests can acquire it.
+                    pass
+
+            future.add_done_callback(release_slot_when_done)
 
 
 def _warm_child() -> bool:
@@ -442,6 +547,16 @@ async def register_feature_in_catalog(
 
         version_id = version["version_id"]
 
+        # This legacy table allocates integer IDs with MAX(id) + 1 and order numbers
+        # with MAX(order_no) + 1. Serialize both reads/writes so concurrent
+        # promotions cannot choose the same primary key or order slot.
+        await session.execute(
+            text(
+                "SELECT pg_advisory_xact_lock("
+                "hashtext('autoalpha_feature_set_item'), hashtext('allocate_id_and_order'))"
+            )
+        )
+
         # 4. 获取当前最大 order_no
         max_order_row = await session.execute(text("""
             SELECT COALESCE(MAX(order_no), 0) + 1 AS next_order
@@ -450,9 +565,10 @@ async def register_feature_in_catalog(
         """), {"vid": version_id})
         next_order = max_order_row.scalar() or 999
 
-        # 5. 插入 set_item（如果不存在）
-        # id 是 integer 类型，使用 MAX(id) + 1
-        max_id_row = await session.execute(text("SELECT COALESCE(MAX(id), 0) + 1 FROM qm_feature_set_item"))
+        # 5. Insert only after the advisory lock made MAX(id) allocation exclusive.
+        max_id_row = await session.execute(
+            text("SELECT COALESCE(MAX(id), 0) + 1 FROM qm_feature_set_item")
+        )
         next_id = max_id_row.scalar() or 1
 
         await session.execute(text("""
@@ -579,11 +695,12 @@ async def promote_factors(req: PromoteRequest):
     # 可选：自动触发训练
     auto_train_triggered = False
     if req.auto_train and promoted:
-        try:
-            # TODO: 调用训练 API
-            auto_train_triggered = True
-        except Exception as e:
-            logger.error("Auto-train failed: %s", e)
+        # The standalone app does not mount a training router. Report the missing
+        # action explicitly instead of claiming a training job was started.
+        errors.append({
+            "kind": "auto_train",
+            "error": AUTO_TRAIN_UNAVAILABLE_MESSAGE,
+        })
 
     return PromoteResponse(
         success=len(promoted) > 0,
@@ -680,6 +797,12 @@ async def promote_factors_by_expression(req: PromoteExpressionRequest):
         except Exception:
             logger.exception("Failed to promote factor %s", factor_name)
             errors.append({"factor_name": factor_name, "error": "因子推广失败"})
+
+    if req.auto_train and promoted:
+        errors.append({
+            "kind": "auto_train",
+            "error": AUTO_TRAIN_UNAVAILABLE_MESSAGE,
+        })
 
     return PromoteResponse(
         success=len(promoted) > 0,

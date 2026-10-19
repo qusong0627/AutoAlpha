@@ -43,7 +43,9 @@ import json
 import logging
 import os
 import shutil
+import stat
 import sys
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -118,16 +120,62 @@ def resolve_roots(
 
 def scan_partitions(dataset_root: Path) -> dict[str, Partition]:
     """扫描 ``dt=*/data.parquet``；目录不存在返回空（首次毕业即正常情况）。"""
-    if not dataset_root.is_dir():
+    try:
+        root_stat = dataset_root.lstat()
+    except FileNotFoundError:
         return {}
+    except OSError as exc:
+        raise RuntimeError(f"无法检查数据集根目录，拒绝继续: {dataset_root}: {exc}") from exc
+    if stat.S_ISLNK(root_stat.st_mode):
+        raise RuntimeError(f"rd_mined 数据集根目录不能是符号链接: {dataset_root}")
+    if not stat.S_ISDIR(root_stat.st_mode):
+        return {}
+
+    # Path.glob may silently suppress directory enumeration errors on newer
+    # Python versions. A partial listing is unsafe here because --prune could
+    # interpret unseen source partitions as deletions.
+    try:
+        with os.scandir(dataset_root) as entries:
+            partition_names = sorted(
+                entry.name
+                for entry in entries
+                if entry.name.startswith(_PARTITION_PREFIX)
+            )
+    except OSError as exc:
+        raise RuntimeError(f"无法完整枚举分区，拒绝继续: {dataset_root}: {exc}") from exc
+
     out: dict[str, Partition] = {}
-    for path in dataset_root.glob(f"{_PARTITION_PREFIX}*/{_PARTITION_FILE}"):
+    for partition_name in partition_names:
+        partition_dir = dataset_root / partition_name
         try:
-            st = path.stat()
-        except OSError as exc:  # 并发写盘时可能瞬时消失
-            logger.warning("跳过不可读分区 %s: %s", path, exc)
+            partition_stat = partition_dir.lstat()
+        except OSError as exc:
+            raise RuntimeError(
+                f"无法检查分区目录，拒绝继续: {partition_dir}: {exc}"
+            ) from exc
+        if stat.S_ISLNK(partition_stat.st_mode):
+            raise RuntimeError(f"拒绝扫描符号链接分区目录: {partition_dir}")
+        if not stat.S_ISDIR(partition_stat.st_mode):
             continue
-        out[path.parent.name] = Partition(path.parent.name, st.st_size, st.st_mtime_ns)
+        path = partition_dir / _PARTITION_FILE
+        try:
+            st = path.lstat()
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"分区目录缺少 {_PARTITION_FILE}，拒绝继续: {partition_dir}"
+            )
+        except OSError as exc:
+            # A skipped source partition would look like an intentional deletion
+            # to --prune. Treat even a transient disappearance as an incomplete
+            # snapshot and abort the whole promotion.
+            raise RuntimeError(f"无法完整扫描分区，拒绝继续: {path}: {exc}") from exc
+        if stat.S_ISLNK(st.st_mode):
+            raise RuntimeError(f"拒绝扫描符号链接分区文件: {path}")
+        if not stat.S_ISREG(st.st_mode):
+            raise RuntimeError(f"拒绝扫描非普通分区文件: {path}")
+        out[partition_dir.name] = Partition(
+            partition_dir.name, st.st_size, st.st_mtime_ns
+        )
     return out
 
 
@@ -158,13 +206,53 @@ def plan_sync(
 
 def _copy_partition(src_file: Path, dst_file: Path) -> None:
     """原子拷贝：同目录 ``.tmp`` → ``os.replace``，读者永远看到完整文件。"""
+    if src_file.parent.is_symlink() or src_file.is_symlink():
+        raise RuntimeError(f"拒绝从符号链接分区读取: {src_file}")
+    if dst_file.parent.is_symlink() or dst_file.is_symlink():
+        raise RuntimeError(f"拒绝写入符号链接分区: {dst_file}")
     dst_file.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst_file.with_suffix(dst_file.suffix + ".tmp")
+    if dst_file.parent.is_symlink() or dst_file.is_symlink():
+        raise RuntimeError(f"分区路径在建目录期间变成符号链接: {dst_file}")
+    src_fd = os.open(
+        src_file,
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0),
+    )
+    tmp_fd: int | None = None
+    tmp: Path | None = None
     try:
-        shutil.copy2(src_file, tmp)
+        src_stat = os.fstat(src_fd)
+        if not stat.S_ISREG(src_stat.st_mode):
+            raise RuntimeError(f"拒绝复制非普通分区文件: {src_file}")
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{dst_file.name}.", suffix=".tmp", dir=dst_file.parent
+        )
+        tmp = Path(tmp_name)
+        with os.fdopen(src_fd, "rb") as src:
+            src_fd = -1
+            with os.fdopen(tmp_fd, "wb") as dst:
+                tmp_fd = None
+                shutil.copyfileobj(src, dst)
+                dst.flush()
+                os.fchmod(dst.fileno(), stat.S_IMODE(src_stat.st_mode))
+                os.fsync(dst.fileno())
+                os.utime(
+                    dst.fileno(),
+                    ns=(src_stat.st_atime_ns, src_stat.st_mtime_ns),
+                )
         os.replace(tmp, dst_file)  # 同文件系统内原子
     finally:
-        tmp.unlink(missing_ok=True)
+        # fdopen closes descriptors after ownership is transferred.
+        for fd in (src_fd, tmp_fd):
+            if fd is None or fd < 0:
+                continue
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 def apply_sync(
@@ -187,15 +275,18 @@ def apply_sync(
         try:
             _copy_partition(src_file, dst_file)
             result.copied.append(name)
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             logger.error("拷贝失败 %s: %s", name, exc)
             result.failed.append({"partition": name, "error": str(exc)})
 
     for name in plan.to_prune:
         try:
-            shutil.rmtree(target_root / name)
+            partition_dir = target_root / name
+            if partition_dir.is_symlink():
+                raise RuntimeError(f"拒绝删除符号链接分区目录: {partition_dir}")
+            shutil.rmtree(partition_dir)
             result.pruned.append(name)
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             logger.error("删除失败 %s: %s", name, exc)
             result.failed.append({"partition": name, "error": str(exc)})
     return result
@@ -254,15 +345,45 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
+    # The materializer and promoter mutate the same library lifecycle. Share its
+    # process lock so a promotion cannot snapshot a source while it is changing.
+    from backend.scripts.rd_mined_materialize import (
+        _acquire_run_lock,
+        _begin_materialization,
+        _finish_materialization,
+    )
+    from backend.services.engine.data_platform.quantdb_factor_reader import (
+        RD_MINED_MATERIALIZATION_MARKER,
+    )
+
+    lock = _acquire_run_lock()
+    if lock is None:
+        logger.error("另一个 rd_mined 物化/毕业进程正在运行，本次退出。")
+        return 2
+
     source_root, target_root = resolve_roots(args.source_root, args.target_root)
     logger.info("源: %s", source_root)
     logger.info("目标: %s", target_root)
+    source_marker = source_root / RD_MINED_MATERIALIZATION_MARKER
+    if source_marker.exists() or source_marker.is_symlink():
+        logger.error("源 rd_mined 有未完成物化标记，拒绝毕业: %s", source_marker)
+        return 2
     if not source_root.is_dir():
         logger.error("源库不存在，无可毕业内容: %s", source_root)
         return 2
 
-    source = scan_partitions(source_root)
-    target = scan_partitions(target_root)
+    target_marker = target_root / RD_MINED_MATERIALIZATION_MARKER
+    recovering = target_marker.exists() or target_marker.is_symlink()
+    if recovering and not args.force and not args.dry_run:
+        logger.error("目标 rd_mined 有未完成镜像标记；恢复必须使用 --force 全量重拷。")
+        return 2
+
+    try:
+        source = scan_partitions(source_root)
+        target = scan_partitions(target_root)
+    except (OSError, RuntimeError) as exc:
+        logger.error("分区扫描失败，拒绝毕业: %s", exc)
+        return 2
     if not source:
         logger.error("源库下没有 dt=*/data.parquet 分区: %s", source_root)
         return 2
@@ -276,6 +397,13 @@ def main(argv: list[str] | None = None) -> int:
     if plan.is_noop:
         logger.info("已是最新，无写入。")
     else:
+        if not args.dry_run:
+            target_root.mkdir(parents=True, exist_ok=True)
+            try:
+                _begin_materialization(target_root)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("无法创建目标不完整标记，拒绝镜像: %s", exc)
+                return 2
         result = apply_sync(source_root, target_root, plan, dry_run=args.dry_run)
         if args.dry_run:
             logger.info(
@@ -312,6 +440,11 @@ def main(argv: list[str] | None = None) -> int:
         "unchanged": len(plan.unchanged),
     }
     _save_manifest(target_root, manifest)
+
+    # The parquet mirror and its manifest are now consistent. Clear the reader
+    # guard before catalog discovery, which must inspect the newly published data.
+    if not plan.is_noop and not args.dry_run:
+        _finish_materialization(target_root)
 
     if args.register:
         rc = _register_fields()

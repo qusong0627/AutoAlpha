@@ -1110,36 +1110,40 @@ class RDLoopWrapper:
         if os.path.isdir(qlib_source):
             # 修复过期 symlink：若指向错误路径则重建
             need_create = False
+            backup = None
+            stale_link_target = None
             if os.path.islink(qlib_target):
-                current_target = os.readlink(qlib_target)
-                if os.path.abspath(current_target) != os.path.abspath(qlib_source):
+                current_target = os.path.realpath(qlib_target)
+                expected_target = os.path.realpath(qlib_source)
+                if current_target != expected_target:
+                    stale_link_target = os.readlink(qlib_target)
                     logger.info(
                         "[%s] Replacing stale symlink: %s -> %s (was %s)",
                         self.market,
                         qlib_target,
                         qlib_source,
-                        current_target,
+                        stale_link_target,
                     )
                     os.unlink(qlib_target)
                     need_create = True
             elif os.path.isdir(qlib_target):
-                # 真实目录而非 symlink，rename 后建 symlink
-                backup = qlib_target + "_backup"
-                logger.info(
-                    "[%s] Replacing real directory with symlink: %s -> %s (backup: %s)",
-                    self.market,
-                    qlib_target,
-                    qlib_source,
-                    backup,
-                )
+                # 保留已有目录；只在备份名空闲时迁移，绝不覆盖旧备份。
+                backup = f"{qlib_target}_backup_{os.getpid()}"
                 try:
-                    if os.path.exists(backup):
-                        shutil.rmtree(backup)
+                    if os.path.lexists(backup):
+                        raise FileExistsError(f"Qlib backup path already exists: {backup}")
                     os.rename(qlib_target, backup)
                     need_create = True
+                    logger.info(
+                        "[%s] Preserved existing Qlib directory at %s; linking %s -> %s",
+                        self.market,
+                        backup,
+                        qlib_target,
+                        qlib_source,
+                    )
                 except Exception as e:
                     logger.warning(
-                        "[%s] Failed to replace directory with symlink: %s",
+                        "[%s] Keeping existing Qlib directory; failed to prepare symlink: %s",
                         self.market,
                         e,
                     )
@@ -1157,6 +1161,29 @@ class RDLoopWrapper:
                         qlib_source,
                     )
                 except Exception as e:
+                    restore_path = backup if backup and os.path.lexists(backup) else None
+                    if restore_path and not os.path.lexists(qlib_target):
+                        try:
+                            os.rename(restore_path, qlib_target)
+                        except OSError as restore_error:
+                            logger.error(
+                                "[%s] Failed to restore Qlib directory %s from %s: %s",
+                                self.market,
+                                qlib_target,
+                                restore_path,
+                                restore_error,
+                            )
+                    elif stale_link_target is not None and not os.path.lexists(qlib_target):
+                        try:
+                            os.symlink(stale_link_target, qlib_target)
+                        except OSError as restore_error:
+                            logger.error(
+                                "[%s] Failed to restore stale Qlib symlink %s -> %s: %s",
+                                self.market,
+                                qlib_target,
+                                stale_link_target,
+                                restore_error,
+                            )
                     logger.warning(
                         "[%s] Failed to create Qlib symlink: %s", self.market, e
                     )

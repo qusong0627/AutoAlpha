@@ -1,7 +1,7 @@
 """RD-Agent 多市场因子挖掘 runner 脚本
 
 由 launcher 作为子进程调用。使用 RDLoopWrapper 运行 RD-Agent 因子挖掘，
-提取发现的因子并持久化到 QuantMind 数据库。
+提取因子并计算指标；runner 退出后由 API 进程查重并写入数据库。
 """
 
 from __future__ import annotations
@@ -25,64 +25,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("rd_agent_run")
-
-
-async def persist_factors(factors: list[dict], task_id: str, user_id: str, market: str, universe: str = "csi300") -> int:
-    """持久化因子到数据库"""
-    if not factors:
-        return 0
-
-    import hashlib
-    from backend.services.engine.qlib_app.services.rd_agent_persistence import (
-        RDAgentFactorPersistence,
-    )
-
-    persistence = RDAgentFactorPersistence()
-    await persistence.ensure_tables()
-
-    count = 0
-    for f in factors:
-        try:
-            raw_id = f"{task_id}:{f['name']}"
-            factor_id = hashlib.md5(raw_id.encode()).hexdigest()
-
-            metadata = {
-                "source": "rd_agent",
-                "market": market,
-                "task_id": task_id,
-                "category": f.get("category", market),
-            }
-            try:
-                from backend.services.engine.rd_agent.factor_sources import (
-                    source_snapshot,
-                )
-
-                metadata.update(source_snapshot(f.get("code") or ""))
-            except Exception:  # noqa: BLE001 - 溯源失败不拦落库
-                pass
-            if f.get("formulation"):
-                metadata["formulation"] = f["formulation"]
-            if f.get("description"):
-                metadata["description"] = f["description"]
-            if f.get("feedback"):
-                metadata["feedback"] = f["feedback"][:2000]
-
-            await persistence.save_factor(
-                factor_id=factor_id,
-                factor_name=f["name"],
-                factor_code=f.get("code", ""),
-                user_id=user_id,
-                metadata=metadata,
-                market=market,
-                universe=universe,
-                factor_formulation=f.get("formulation", ""),
-            )
-            count += 1
-            logger.info("Persisted factor: %s (market=%s, universe=%s, id=%s)", f["name"], market, universe, factor_id)
-        except Exception as e:
-            logger.warning("Failed to persist factor %s: %s", f["name"], e)
-
-    return count
 
 
 def _dedupe_against_corpus(
@@ -270,11 +212,17 @@ def compute_factor_ic(
 
     Returns dict with: ic, rank_ic, icir, rank_icir (or empty dict on failure)
     """
+    import shutil
     import tempfile
-    import subprocess
-    import sys
 
     if not factor_code or not Path(data_path).exists():
+        return {}
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        logger.error("IC 因子代码沙箱不可用：未安装 bubblewrap，拒绝执行")
+        return {}
+    data_file = Path(data_path).resolve()
+    if not data_file.is_file():
         return {}
 
     # Create a temporary script that executes the factor code and computes IC
@@ -322,7 +270,7 @@ try:
         sys.exit(1)
 
     # Load price data for returns
-    price_df = pd.read_hdf("{data_path}")
+    price_df = pd.read_hdf({"/tmp/daily_pv.h5"!r})
     # 可选：切片到回测窗口（end=最新交易日，start=end-N年）
     _start = {start!r}
     _end = {end!r}
@@ -449,17 +397,86 @@ except Exception as e:
             f.write(script)
             script_path = f.name
 
-        # Copy data file to /tmp for the script (factor code expects 'daily_pv.h5')
-        import shutil
-        tmp_data = '/tmp/daily_pv.h5'
-        if not os.path.exists(tmp_data):
-            shutil.copy2(data_path, tmp_data)
-        elif os.path.getmtime(data_path) > os.path.getmtime(tmp_data):
-            shutil.copy2(data_path, tmp_data)
-
+        sandbox_args = [
+            bwrap,
+            "--die-with-parent",
+            "--unshare-all",
+            "--ro-bind", "/", "/",
+            "--proc", "/proc",
+            "--dev", "/dev",
+            "--tmpfs", "/run",
+            "--tmpfs", "/tmp",
+            "--tmpfs", "/home",
+            "--tmpfs", "/root",
+            "--dir", "/tmp/factor-home",
+            "--ro-bind", str(script_path), "/tmp/factor_ic.py",
+            "--ro-bind", str(data_file), "/tmp/daily_pv.h5",
+        ]
+        private_env_candidates = [
+            Path(_project_root) / "config" / "runtime.env",
+            Path(
+                os.getenv("QM_RUNTIME_ENV_FILE", "").strip()
+                or (Path.home() / ".config" / "autoalpha" / "runtime.env")
+            ),
+        ]
+        for private_env in private_env_candidates:
+            private_env = private_env.resolve()
+            if (
+                private_env.is_file()
+                and not private_env.is_relative_to(Path("/home"))
+                and not private_env.is_relative_to(Path("/root"))
+            ):
+                sandbox_args.extend(["--ro-bind", "/dev/null", str(private_env)])
+        # Python must remain available after masking user homes. The project venv
+        # is mounted read-only; generated factor code sees no other home files.
+        venv = Path(sys.prefix).resolve()
+        home_root = Path("/home")
+        if venv.is_relative_to(home_root):
+            current = home_root
+            for part in venv.parent.relative_to(home_root).parts:
+                current = current / part
+                sandbox_args.extend(["--dir", str(current)])
+            sandbox_args.extend(["--ro-bind", str(venv), str(venv)])
+        sandbox_args.extend(["--chdir", "/tmp", "--clearenv"])
+        sandbox_env = {
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "HOME": "/tmp/factor-home",
+            "TMPDIR": "/tmp",
+            "TMP": "/tmp",
+            "TEMP": "/tmp",
+            "PYTHONPATH": str(_project_root),
+            "PYTHONUNBUFFERED": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "FACTOR_DATA_PATH": "/tmp/daily_pv.h5",
+            "OMP_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+            "QLIB_KERNELS": "1",
+        }
+        for key in (
+            "QLIB_PROVIDER_URI",
+            "QM_QUANTDB_DATA_DIR",
+            "QM_QUANTCUSTOM_DATA_DIR",
+            "QLIB_FACTOR_UNIVERSE",
+            "QLIB_FACTOR_TRAIN_START",
+            "QLIB_FACTOR_VALID_START",
+            "QLIB_FACTOR_VALID_END",
+            "QLIB_FACTOR_TEST_START",
+            "QLIB_FACTOR_TEST_END",
+        ):
+            if os.environ.get(key):
+                sandbox_env[key] = os.environ[key]
+        for key, value in sandbox_env.items():
+            sandbox_args.extend(["--setenv", key, value])
+        sandbox_args.extend(["--", sys.executable, "/tmp/factor_ic.py"])
         result = subprocess.run(
-            [sys.executable, script_path],
-            capture_output=True, text=True, timeout=120, cwd='/tmp'
+            sandbox_args,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd="/tmp",
+            env={"PATH": "/usr/local/bin:/usr/bin:/bin"},
         )
 
         os.unlink(script_path)
@@ -575,128 +592,82 @@ def main():
             ic_start, ic_end = ic_window
             logger.info("IC window (%s): %s ~ %s", ic_window_kind, ic_start, ic_end)
 
-        import hashlib
+        # DB credentials are deliberately absent from this runner because RD-Agent
+        # executes generated Python. Return the evaluated records to the trusted API
+        # process, which owns database persistence after this process exits.
+        factor_records: list[dict] = []
+        for f in factors:
+            metadata: dict = {
+                "source": "rd_agent",
+                "market": args.market,
+                "task_id": args.task_id,
+                "category": f.get("category", args.market),
+            }
+            if f.get("formulation"):
+                metadata["formulation"] = f["formulation"]
+            if f.get("description"):
+                metadata["description"] = f["description"]
+            if f.get("feedback"):
+                metadata["feedback"] = f["feedback"][:2000]
 
-        from backend.services.engine.qlib_app.services.rd_agent_persistence import (
-            RDAgentFactorPersistence,
-        )
-
-        async def _persist_and_metrics() -> int:
-            p = RDAgentFactorPersistence()
-            await p.ensure_tables()
-            corpus: list[dict] = []
-            corpus_limit = 5000
-            try:
-                corpus = await p.list_factors(market=args.market, limit=corpus_limit)
-            except Exception as exc:
-                logger.warning(
-                    "查重语料读取失败（跳过落库前查重，重复因子可能入库）：%s", exc
-                )
-            if len(corpus) >= corpus_limit:
-                # list_factors 按 created_at DESC 截断：被丢的是**最早**的因子，
-                # 恰恰是新因子最可能撞的那批——必须显式可见，别让廉价层静默变薄
-                logger.warning(
-                    "查重语料达上限 %d 条：更早的存量因子未参与本批查重", corpus_limit
-                )
-            dup_ids = _dedupe_against_corpus(corpus, factors, args.task_id)
-            saved = 0
-            for f in factors:
-                try:
-                    fid = hashlib.md5(f"{args.task_id}:{f['name']}".encode()).hexdigest()
-                    if fid in dup_ids:
-                        continue
-                    metadata: dict = {
-                        "source": "rd_agent",
-                        "market": args.market,
-                        "task_id": args.task_id,
-                        "category": f.get("category", args.market),
-                    }
-                    if f.get("formulation"):
-                        metadata["formulation"] = f["formulation"]
-                    if f.get("description"):
-                        metadata["description"] = f["description"]
-                    if f.get("feedback"):
-                        metadata["feedback"] = f["feedback"][:2000]
-
-                    status = "pending"
-                    ic_value = None
-                    rank_ic = None
-                    if Path(data_path).exists() and f.get("code"):
-                        metrics = await asyncio.to_thread(
-                            compute_factor_ic, f["code"], data_path, ic_start, ic_end
-                        )
-                        if metrics:
-                            status = "completed"
-                            ic_value = metrics.get("ic")
-                            rank_ic = metrics.get("rank_ic")
-                            metadata.update({
-                                "icir": metrics.get("icir", 0),
-                                "rank_icir": metrics.get("rank_icir", 0),
-                                "data_source": "task_h5",
-                                # IC 口径可追溯：近一年 / 挖掘段 test / 样本外检验
-                                "ic_window_kind": ic_window_kind,
-                                "ic_window_start": ic_start,
-                                "ic_window_end": ic_end,
-                            })
-                            logger.info(
-                                "  %s: IC=%.4f, RankIC=%.4f, ICIR=%.4f",
-                                f["name"], ic_value or 0, rank_ic or 0,
-                                metrics.get("icir", 0),
-                            )
-                        else:
-                            logger.info("  %s: IC computation empty", f["name"])
-
-                    await p.save_factor(
-                        factor_id=fid,
-                        factor_name=f["name"],
-                        factor_code=f.get("code", ""),
-                        user_id=args.user_id,
-                        metadata=metadata,
-                        market=args.market,
-                        universe=args.universe,
-                        factor_formulation=f.get("formulation", ""),
+            status = "pending"
+            ic_value = None
+            rank_ic = None
+            if Path(data_path).exists() and f.get("code"):
+                metrics = compute_factor_ic(f["code"], data_path, ic_start, ic_end)
+                if metrics:
+                    status = "completed"
+                    ic_value = metrics.get("ic")
+                    rank_ic = metrics.get("rank_ic")
+                    metadata.update({
+                        "icir": metrics.get("icir", 0),
+                        "rank_icir": metrics.get("rank_icir", 0),
+                        "data_source": "task_h5",
+                        "ic_window_kind": ic_window_kind,
+                        "ic_window_start": ic_start,
+                        "ic_window_end": ic_end,
+                    })
+                    logger.info(
+                        "  %s: IC=%.4f, RankIC=%.4f, ICIR=%.4f",
+                        f["name"], ic_value or 0, rank_ic or 0,
+                        metrics.get("icir", 0),
                     )
-                    await p.update_factor_metrics(
-                        factor_id=fid,
-                        status=status,
-                        ic_value=ic_value,
-                        rank_ic=rank_ic,
-                        metadata=metadata,
-                    )
-                    saved += 1
-                except Exception as e:
-                    logger.warning("Failed to persist factor %s: %s", f["name"], e)
-            return saved
+                else:
+                    logger.info("  %s: IC computation empty", f["name"])
 
-        count = asyncio.run(_persist_and_metrics())
-        logger.info("Persisted %d factors to database", count)
-        if count:
-            from backend.services.engine.alpha_agent.factor_naming import (
-                spawn_task_factor_naming,
-            )
-
-            spawn_task_factor_naming(args.task_id, args.user_id, log_dir)
+            factor_records.append({
+                **f,
+                "metadata": metadata,
+                "status": status,
+                "ic_value": ic_value,
+                "rank_ic": rank_ic,
+            })
 
         # Write result JSON for launcher to read
         result_file = Path(log_dir) / "result.json"
-        result_file.write_text(json.dumps({
+        result_payload = json.dumps({
             "task_id": args.task_id,
             "market": args.market,
             "total_factors": len(factors),
-            "persisted_factors": count,
+            "persisted_factors": 0,
+            "persistence_pending": True,
+            "data_path": data_path,
+            "factors": factor_records,
             "elapsed_seconds": elapsed,
-        }, indent=2))
+        }, ensure_ascii=False, indent=2, allow_nan=False)
+        # The RD-Agent subprocess runs generated code in this task directory.
+        # Remove any path it may have planted, then exclusively create a private
+        # regular result file so a symlink cannot redirect this write.
+        result_file.unlink(missing_ok=True)
+        result_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        result_fd = os.open(result_file, result_flags, 0o600)
+        with os.fdopen(result_fd, "w", encoding="utf-8") as result_handle:
+            result_handle.write(result_payload)
 
         logger.info("=" * 60)
         logger.info("RD-Agent task complete! task_id=%s, market=%s", args.task_id, args.market)
-        logger.info("  Found: %d factors, Persisted: %d", len(factors), count)
+        logger.info("  Found: %d factors; persistence deferred to API process", len(factors))
         logger.info("=" * 60)
-
-        # 落库后自动物化（rd_mined 库，训练直读链路）——后台子进程，不阻塞收尾
-        _maybe_spawn_materialize(args, log_dir, data_path, count)
-
-        # 落库后自动验证（T-MV-09 六节报告）——后台子进程，不阻塞收尾
-        _maybe_spawn_validate(args, log_dir, data_path, count)
 
     except Exception as e:
         logger.exception("RD-Agent runner failed: %s", e)

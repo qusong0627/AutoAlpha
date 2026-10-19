@@ -159,7 +159,13 @@ def load_auto(qroot: Path) -> tuple[dict[str, list[dict]], list[dict]]:
         # 下划线必须排除，不只是为了整洁：`_`(0x5F) 字典序在字母前，试跑目录会排在
         # 正式库前面先占住列名，正式库的同名列随即被 seen 过滤掉 —— 因子还在，但
         # 用的是试跑那份（通常窗口短得多）的数据，且全程不报错。
-        if not d_.is_dir() or d_.name in AUTO_SKIP or d_.name.startswith((".", "_")):
+        if (
+            not d_.is_dir()
+            or d_.name in AUTO_SKIP
+            or d_.name.startswith((".", "_"))
+            or (d_ / ".materialization-incomplete").exists()
+            or (d_ / ".materialization-incomplete").is_symlink()
+        ):
             continue
         parts = sorted(d_.glob("dt=*/data.parquet"))
         if parts:

@@ -38,6 +38,8 @@ FACTOR_SOURCE_DIRS: dict[FactorSource, str] = {
 }
 DAILY_BACKWARD_DIR = "1_kline_data/daily_backward"
 DEFAULT_FACTOR_SOURCE: FactorSource = "l1_factors"
+RD_MINED_SOURCE = "rd_mined"
+RD_MINED_MATERIALIZATION_MARKER = ".materialization-incomplete"
 
 # ── 市场 → 可用因子源映射（后台「模型训练数据集」与训练页数据源选择共用）───────
 # 各市场 6_ml_datasets/ 下实际存在的训练直读数据集。
@@ -306,16 +308,30 @@ class QuantDBFactorReader:
                 )
         return source
 
-    def source_path(self, source: str) -> Path:
+    def source_path(self, source: str, *, allow_materializing: bool = False) -> Path:
         mapped = FACTOR_SOURCE_DIRS.get(source)
         if mapped is not None:
-            return self.data_dir / mapped
-        # 动态目录：注册表外的 6_ml_datasets 子目录（validate 校验命名/排除清单）
-        self.validate_source(source)
-        return self.data_dir / "6_ml_datasets" / source
+            root = self.data_dir / mapped
+        else:
+            # 动态目录：注册表外的 6_ml_datasets 子目录（validate 校验命名/排除清单）
+            self.validate_source(source)
+            root = self.data_dir / "6_ml_datasets" / source
+        marker = root / RD_MINED_MATERIALIZATION_MARKER
+        if (
+            source == RD_MINED_SOURCE
+            and not allow_materializing
+            and (marker.exists() or marker.is_symlink())
+        ):
+            raise QuantDBFactorError(
+                "rd_mined materialization is incomplete; data reads are blocked "
+                "until a full recovery run succeeds"
+            )
+        return root
 
-    def _files(self, source: str) -> list[Path]:
-        root = self.source_path(source)
+    def _files(
+        self, source: str, *, allow_materializing: bool = False
+    ) -> list[Path]:
+        root = self.source_path(source, allow_materializing=allow_materializing)
         # 只统计已发布的 dt= 分区文件，排除 _stage 等非分区暂存目录，
         # 否则暂存 parquet 会被计入分区文件数，与实际可读数据不一致。
         return sorted(root.glob("dt=*/*.parquet")) if root.is_dir() else []
@@ -444,10 +460,34 @@ class QuantDBFactorReader:
         finally:
             con.close()
 
-    def describe(self, source: str) -> FactorSourceStatus:
+    def describe(
+        self, source: str, *, allow_materializing: bool = False
+    ) -> FactorSourceStatus:
         source = self.validate_source(source)
-        files = self._files(source)
-        root = self.source_path(source)
+        root = self.source_path(source, allow_materializing=True)
+        marker = root / RD_MINED_MATERIALIZATION_MARKER
+        if (
+            source == RD_MINED_SOURCE
+            and (marker.exists() or marker.is_symlink())
+            and not allow_materializing
+        ):
+            return FactorSourceStatus(
+                dataset_id=source,
+                path=str(root),
+                files=0,
+                columns=[],
+                column_types={},
+                schema_hash="",
+                min_date=None,
+                max_date=None,
+                ready=False,
+                missing_required=list(REQUIRED_COLUMNS),
+                reason=(
+                    "Materialization is incomplete; a full --force recovery run "
+                    "must succeed before this source can be read"
+                ),
+            )
+        files = self._files(source, allow_materializing=allow_materializing)
         if not files:
             return FactorSourceStatus(
                 dataset_id=source,

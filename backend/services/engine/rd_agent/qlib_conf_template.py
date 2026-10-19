@@ -284,6 +284,10 @@ def install_qlib_execute_patch() -> bool:
     自身的失败被上层捕获。
     """
     import logging
+    import os
+    import shutil
+    import subprocess
+    import sys
 
     logger = logging.getLogger(__name__)
     try:
@@ -295,6 +299,92 @@ def install_qlib_execute_patch() -> bool:
     if getattr(QlibFBWorkspace, "_qm_conf_rendering_patched", False):
         return False
     original_execute = QlibFBWorkspace.execute
+    workspace_module = sys.modules[QlibFBWorkspace.__module__]
+    if not callable(getattr(workspace_module, "_run_cmd_in_current_env", None)):
+        raise RuntimeError("RD-Agent command runner is unavailable; refusing unsandboxed execution")
+
+    def sandboxed_run_cmd(entry: str, local_path: str, env: dict | None = None) -> str:
+        """Run Qlib's generated-factor execution without inherited credentials."""
+        bwrap = shutil.which("bwrap")
+        if not bwrap:
+            raise RuntimeError("bubblewrap is required to execute RD-Agent factor code")
+        workspace = Path(local_path).resolve(strict=True)
+        if not workspace.is_dir():
+            raise RuntimeError(f"RD-Agent execution workspace is not a directory: {workspace}")
+
+        child_env = {**os.environ, **(env or {})}
+        for key in tuple(child_env):
+            upper_key = key.upper()
+            normalized = "".join(char for char in upper_key if char.isalnum())
+            if (
+                upper_key in {"DATABASE_URL", "INTERNAL_CALL_SECRET", "SECRET_KEY", "JWT_SECRET", "JWT_SECRET_KEY", "REDIS_URL", "CELERY_BROKER_URL", "CELERY_RESULT_BACKEND", "LITELLM_MASTER_KEY", "NETRC"}
+                or upper_key.startswith(("DB_", "POSTGRES_"))
+                or upper_key == "PGPASSWORD"
+                or upper_key.endswith(("_API_KEY", "_TOKEN", "_SECRET", "_SECRET_KEY", "_PASSWORD", "_MASTER_KEY", "_PRIVATE_KEY", "_SIGNING_KEY", "_CREDENTIAL", "_CREDENTIALS", "_CREDENTIAL_FILE"))
+                or "CREDENTIAL" in normalized
+                or normalized.endswith(("SECRETID", "SECRETACCESSKEY", "ACCESSKEYID", "CLIENTSECRET"))
+            ):
+                child_env.pop(key, None)
+        child_env["HOME"] = "/tmp"
+        child_env["TMPDIR"] = "/tmp"
+        child_env["TMP"] = "/tmp"
+        child_env["TEMP"] = "/tmp"
+
+        sandbox_args = [
+            bwrap,
+            "--die-with-parent",
+            "--unshare-all",
+            "--ro-bind", "/", "/",
+            "--proc", "/proc",
+            "--dev", "/dev",
+            "--tmpfs", "/run",
+            "--tmpfs", "/tmp",
+            "--tmpfs", "/home",
+            "--tmpfs", "/root",
+            "--bind", str(workspace), str(workspace),
+        ]
+        private_env_candidates = [
+            Path(__file__).resolve().parents[4] / "config" / "runtime.env",
+            Path(os.getenv("QM_RUNTIME_ENV_FILE", "").strip() or "/dev/null"),
+            Path.home() / ".config" / "autoalpha" / "runtime.env",
+        ]
+        for private_env in private_env_candidates:
+            try:
+                private_env = private_env.resolve(strict=True)
+                if private_env.is_file() and not private_env.is_relative_to(Path("/home")):
+                    sandbox_args.extend(["--ro-bind", "/dev/null", str(private_env)])
+            except OSError:
+                continue
+
+        venv = Path(sys.prefix).resolve()
+        home_root = Path("/home")
+        if venv.is_relative_to(home_root):
+            current = home_root
+            for part in venv.parent.relative_to(home_root).parts:
+                current = current / part
+                sandbox_args.extend(["--dir", str(current)])
+            sandbox_args.extend(["--ro-bind", str(venv), str(venv)])
+        sandbox_args.extend(["--chdir", str(workspace), "--clearenv"])
+        for key, value in child_env.items():
+            sandbox_args.extend(["--setenv", key, str(value)])
+        sandbox_args.extend(["--", "/bin/sh", "-lc", entry])
+
+        result = subprocess.run(
+            sandbox_args,
+            cwd="/",
+            env={"PATH": os.getenv("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8"},
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            output = result.stderr if result.stderr else result.stdout
+            raise RuntimeError(
+                f"Command failed (exit {result.returncode}): {entry}\n{output[-2000:]}"
+            )
+        return result.stdout if result.stdout else result.stderr
+
+    workspace_module._run_cmd_in_current_env = sandboxed_run_cmd
 
     def patched_execute(
         self, qlib_config_name: str = "conf.yaml", run_env: dict | None = None, *args, **kwargs

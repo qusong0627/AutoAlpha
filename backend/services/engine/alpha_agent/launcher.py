@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import shutil
 import signal
@@ -240,6 +241,44 @@ def _stop_persisted_process_group(data: dict[str, Any]) -> bool:
         return False
 
 
+async def _terminate_task_process_group(
+    process: subprocess.Popen,
+    *,
+    grace_seconds: float = 5.0,
+) -> None:
+    """Stop a task's session, including descendants that outlive its leader."""
+    pgid = process.pid  # runner Popen uses start_new_session=True
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        if process.poll() is None:
+            process.terminate()
+    except OSError:
+        if process.poll() is None:
+            process.terminate()
+
+    deadline = time.monotonic() + max(0.0, grace_seconds)
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            break
+        except OSError:
+            break
+        await asyncio.sleep(0.1)
+
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        if process.poll() is None:
+            process.kill()
+    except OSError:
+        if process.poll() is None:
+            process.kill()
+    if process.poll() is None:
+        await asyncio.to_thread(process.wait)
+
+
 async def _snapshot_data_versions_for_task(
     *, market: str, freq: str | None, datasets: Sequence[str]
 ) -> dict[str, Any]:
@@ -320,8 +359,11 @@ ENV_MAX_RUNNING_PER_USER = "ALPHA_AGENT_MAX_RUNNING_PER_USER"
 ENV_MAX_RUNNING_GLOBAL = "ALPHA_AGENT_MAX_RUNNING_GLOBAL"
 ENV_MAX_QUEUED_PER_USER = "ALPHA_AGENT_MAX_QUEUED_PER_USER"
 ENV_MAX_QUEUED_GLOBAL = "ALPHA_AGENT_MAX_QUEUED_GLOBAL"
-DEFAULT_MAX_RUNNING_PER_USER = 2
-DEFAULT_MAX_RUNNING_GLOBAL = 4
+# Local single-user deployment defaults: one RD-Agent run can saturate the
+# available CPU/memory even when the minimum hardware probe is bypassed for dev.
+# Operators may raise these explicitly after measuring the actual workload.
+DEFAULT_MAX_RUNNING_PER_USER = 1
+DEFAULT_MAX_RUNNING_GLOBAL = 1
 DEFAULT_MAX_QUEUED_PER_USER = 20
 DEFAULT_MAX_QUEUED_GLOBAL = 50
 
@@ -410,13 +452,18 @@ def _secure_task_log_dir(path: Path) -> None:
 
 
 def _strip_unneeded_child_secrets(
-    env: dict[str, str], *, needs_llm: bool, needs_factor_name_llm: bool
+    env: dict[str, str],
+    *,
+    needs_llm: bool,
+    needs_factor_name_llm: bool,
+    needs_database: bool = False,
 ) -> None:
     """Remove credentials the mining runner does not need.
 
     LLM and optional factor-name providers receive only their selected key(s).
-    Database, internal-auth, JWT, and unrelated provider credentials stay in the
-    API process even though the runner executes generated factor code.
+    Database access is retained only for the deterministic statistical runner.
+    The LLM runner executes generated Python and persists its result in the API
+    process after exit.
     """
     llm_keys: set[str] = set()
     if needs_llm:
@@ -446,12 +493,27 @@ def _strip_unneeded_child_secrets(
     for key in tuple(env):
         if key in llm_keys:
             continue
-        normalized_key = "".join(char for char in key.upper() if char.isalnum())
+        upper_key = key.upper()
+        is_database_key = (
+            upper_key == "DATABASE_URL"
+            or upper_key.startswith(("DB_", "POSTGRES_"))
+            or upper_key == "PGPASSWORD"
+        )
+        if needs_database and is_database_key:
+            continue
+        normalized_key = "".join(char for char in upper_key if char.isalnum())
         if (
-            key in exact_secret_names
-            or key.startswith(("DB_", "POSTGRES_"))
-            or key == "PGPASSWORD"
-            or key.endswith(("_API_KEY", "_TOKEN", "_SECRET", "_SECRET_KEY", "_PASSWORD"))
+            upper_key in exact_secret_names
+            or is_database_key
+            or upper_key.endswith(
+                (
+                    "_API_KEY", "_TOKEN", "_SECRET", "_SECRET_KEY", "_PASSWORD",
+                    "_MASTER_KEY", "_PRIVATE_KEY", "_SIGNING_KEY", "_CREDENTIAL",
+                    "_CREDENTIALS", "_CREDENTIAL_FILE",
+                )
+            )
+            or "CREDENTIAL" in normalized_key
+            or upper_key == "NETRC"
             # Tencent COS and AWS-style credentials use names such as
             # ``TENCENT_SECRET_ID`` / ``AWS_ACCESS_KEY_ID``; legacy SDKs also
             # accept camel-case ``SecretId``. Normalize separators and case so
@@ -858,6 +920,7 @@ class AlphaAgentLauncher:
         self._owned_queued_task_ids: set[str] = set()
         # 排空重入闸：并发 drain（收尾触发 vs 清扫器）只允许一个在跑
         self._draining = False
+        self._background_naming_tasks: set[asyncio.Task[Any]] = set()
         self._load_tasks()
 
     # ------------------------------------------------------------------
@@ -1509,20 +1572,9 @@ class AlphaAgentLauncher:
             return False
         task._cancel_requested = True
         # 排队任务还没有进程，杀掉这一步天然跳过
-        if task.process and task.process.poll() is None:
+        if task.process:
             try:
-                pgid = os.getpgid(task.process.pid)
-                os.killpg(pgid, signal.SIGTERM)
-                # Wait up to 5 seconds, then SIGKILL
-                for _ in range(10):
-                    if task.process.poll() is not None:
-                        break
-                    await asyncio.sleep(0.5)
-                if task.process.poll() is None:
-                    os.killpg(pgid, signal.SIGKILL)
-                    logger.warning(
-                        "Force-killed process group %d for task %s", pgid, task_id
-                    )
+                await _terminate_task_process_group(task.process)
             except ProcessLookupError:
                 pass
             except Exception as e:
@@ -1637,12 +1689,35 @@ class AlphaAgentLauncher:
 
     async def _db_sync_progress(self, task: EvolutionTask) -> None:
         try:
+            from backend.services.engine.alpha_agent.task_store import (
+                TaskLeaseLostError,
+            )
+
             await _task_store().update_progress(
                 task.task_id,
                 status=task.status.value,
                 progress_pct=task.progress_pct,
                 current_loop=task.current_loop,
             )
+        except TaskLeaseLostError:
+            logger.error(
+                "mining task lease lost for %s; stopping stale runner", task.task_id
+            )
+            if not task._cancel_requested:
+                task._cancel_requested = True
+                task.status = TaskStatus.FAILED
+                task.error_message = "Mining task ownership lease was lost"
+                task.progress = task.error_message
+            self._persist_task(task)
+            if task.process:
+                try:
+                    await _terminate_task_process_group(task.process)
+                except Exception as e:
+                    logger.warning(
+                        "Could not stop runner after lease loss for %s: %s",
+                        task.task_id,
+                        e,
+                    )
         except Exception as e:
             logger.warning(
                 "mining task progress sync failed for %s: %s", task.task_id, e
@@ -1687,6 +1762,29 @@ class AlphaAgentLauncher:
                     e,
                 )
                 await asyncio.sleep(0.25 * (2**attempt))
+
+    def _spawn_factor_naming(self, task: EvolutionTask) -> None:
+        """Run optional naming in the API process, outside the secret-stripped runner."""
+
+        async def _name() -> None:
+            try:
+                from backend.services.engine.alpha_agent.factor_naming import (
+                    name_task_factors_cn,
+                )
+
+                await name_task_factors_cn(task.task_id, task.user_id)
+            except Exception as exc:  # noqa: BLE001 - naming never changes task result
+                logger.warning(
+                    "factor naming failed for task %s: %s",
+                    task.task_id,
+                    redact_text(exc),
+                )
+
+        background = asyncio.create_task(
+            _name(), name=f"factor-naming-{task.task_id}"
+        )
+        self._background_naming_tasks.add(background)
+        background.add_done_callback(self._background_naming_tasks.discard)
 
     async def _db_cancel(self, task: EvolutionTask) -> None:
         for attempt in range(_DB_TERMINAL_WRITE_ATTEMPTS):
@@ -1898,6 +1996,8 @@ class AlphaAgentLauncher:
         self._persist_task(task)
         task._last_db_sync = time.time()
         await self._db_sync_progress(task)
+        if task._cancel_requested:
+            return
 
         if task.data_source.lower().strip() == "parquet":
             try:
@@ -1928,6 +2028,8 @@ class AlphaAgentLauncher:
             task.progress = "数据准备完成，正在启动因子挖掘..."
             self._persist_task(task)
             await self._db_sync_progress(task)
+            if task._cancel_requested:
+                return
 
         task_log_dir = self._log_dir / task.task_id
         _secure_task_log_dir(task_log_dir)
@@ -2154,6 +2256,7 @@ class AlphaAgentLauncher:
             env,
             needs_llm=algo.uses_llm,
             needs_factor_name_llm=bool(llm_overrides),
+            needs_database=algo.key == "statistical",
         )
 
         cmd = _build_runner_cmd(
@@ -2173,6 +2276,13 @@ class AlphaAgentLauncher:
         stream_thread: threading.Thread | None = None
 
         try:
+            # Preparation (Qlib cache, pool retrieval, config resolution) can take
+            # long enough for another process to claim or finalize this task.
+            # Revalidate immediately before spawning untrusted runner code.
+            await self._db_sync_progress(task)
+            if task._cancel_requested:
+                return
+
             log_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
             log_fd = os.open(stdout_log, log_flags, 0o600)
             if os.name == "posix":
@@ -2214,6 +2324,8 @@ class AlphaAgentLauncher:
                     break
                 self._refresh_progress(task, task_log_dir, algo)
                 await self._db_sync_progress_throttled(task)
+                if task._cancel_requested:
+                    break
                 await asyncio.sleep(3)
 
             if process.poll() is None:
@@ -2247,11 +2359,12 @@ class AlphaAgentLauncher:
             self._refresh_progress(task, task_log_dir, algo, finished=True)
 
             if process.returncode == 0:
+                task.result = await self._persist_rd_agent_results(task, task_log_dir)
                 task.status = TaskStatus.COMPLETED
                 task.phase = "completed"
                 task.progress_pct = 100
                 task.progress = "因子挖掘完成"
-                task.result = self._collect_results(task, task_log_dir)
+                self._spawn_factor_naming(task)
             else:
                 task.status = TaskStatus.FAILED
                 error_output = self._tail_error_log(task_log_dir)
@@ -2766,20 +2879,185 @@ class AlphaAgentLauncher:
             "models": list(models),
         }
 
+    async def _persist_rd_agent_results(
+        self, task: EvolutionTask, log_dir: Path
+    ) -> dict[str, Any]:
+        """Persist RD-Agent output after its secret-stripped runner has exited."""
+        result_file = log_dir / "result.json"
+        result = self._collect_results(task, log_dir)
+        if not result.get("persistence_pending"):
+            return result
+
+        factors = result.get("factors")
+        if not isinstance(factors, list) or len(factors) > 100:
+            raise RuntimeError("RD-Agent result has an invalid factor list")
+        if any(not isinstance(item, dict) for item in factors):
+            raise RuntimeError("RD-Agent result contains an invalid factor record")
+
+        import hashlib
+        from types import SimpleNamespace
+
+        from backend.services.engine.qlib_app.services.rd_agent_persistence import (
+            RDAgentFactorPersistence,
+        )
+
+        persistence = RDAgentFactorPersistence()
+        await persistence.ensure_tables()
+        corpus_limit = 5000
+        corpus = await persistence.list_factors(
+            market=task.market, limit=corpus_limit
+        )
+        if len(corpus) >= corpus_limit:
+            logger.warning(
+                "RD-Agent task %s dedupe corpus reached %d rows; older factors were not checked",
+                task.task_id,
+                corpus_limit,
+            )
+        from scripts.alpha_agent.run_rd_agent import (
+            _dedupe_against_corpus,
+            _maybe_spawn_materialize,
+            _maybe_spawn_validate,
+        )
+
+        duplicate_ids = _dedupe_against_corpus(corpus, factors, task.task_id)
+        saved = 0
+        for factor in factors:
+            name = str(factor.get("name") or "").strip()
+            code = factor.get("code")
+            if (
+                not name
+                or len(name) > 500
+                or not isinstance(code, str)
+                or len(code.encode("utf-8")) > 100_000
+            ):
+                raise RuntimeError("RD-Agent result contains an invalid factor name/code")
+            factor_id = hashlib.md5(
+                f"{task.task_id}:{name}".encode("utf-8")
+            ).hexdigest()
+            if factor_id in duplicate_ids:
+                continue
+            metadata = factor.get("metadata")
+            if not isinstance(metadata, dict):
+                raise RuntimeError(f"RD-Agent factor {name!r} has invalid metadata")
+            if len(json.dumps(metadata, ensure_ascii=False, allow_nan=False)) > 100_000:
+                raise RuntimeError(f"RD-Agent factor {name!r} metadata is too large")
+            metadata = {
+                **metadata,
+                "source": "rd_agent",
+                "market": task.market,
+                "task_id": task.task_id,
+            }
+            status = factor.get("status") or "pending"
+            if status not in {"pending", "completed"}:
+                raise RuntimeError(f"RD-Agent factor {name!r} has invalid status")
+            metrics: dict[str, float | None] = {}
+            for key in ("ic_value", "rank_ic"):
+                value = factor.get(key)
+                if value is not None:
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        raise RuntimeError(f"RD-Agent factor {name!r} has invalid {key}")
+                    if not math.isfinite(float(value)):
+                        raise RuntimeError(f"RD-Agent factor {name!r} has non-finite {key}")
+                    metrics[key] = float(value)
+                else:
+                    metrics[key] = None
+            await persistence.save_factor(
+                factor_id=factor_id,
+                factor_name=name,
+                factor_code=code,
+                user_id=task.user_id,
+                metadata=metadata,
+                market=task.market,
+                universe=task.universe,
+                factor_formulation=str(factor.get("formulation") or ""),
+            )
+            await persistence.update_factor_metrics(
+                factor_id=factor_id,
+                status=status,
+                ic_value=metrics["ic_value"],
+                rank_ic=metrics["rank_ic"],
+                metadata=metadata,
+            )
+            saved += 1
+
+        # Persist the compact public result first. Generated code and the runner
+        # process no longer need to retain database access for post-processing.
+        summary = {
+            key: value
+            for key, value in result.items()
+            if key not in {"factors", "data_path"}
+        }
+        summary.update(
+            {
+                "persisted_factors": saved,
+                "persistence_pending": False,
+            }
+        )
+        import tempfile
+
+        fd, temp_name = tempfile.mkstemp(prefix=".result-", suffix=".tmp", dir=log_dir)
+        try:
+            if os.name == "posix":
+                os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False)
+                )
+            os.replace(temp_name, result_file)
+        except Exception:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+            raise
+
+        args = SimpleNamespace(
+            task_id=task.task_id,
+            market=task.market,
+            universe=task.universe,
+        )
+        data_path = ""
+        candidate_h5 = log_dir / "git_ignore_folder" / "factor_implementation_source_data" / "daily_pv.h5"
+        if candidate_h5.is_file() and not candidate_h5.is_symlink():
+            data_path = str(candidate_h5)
+        _maybe_spawn_materialize(args, str(log_dir), data_path, saved)
+        _maybe_spawn_validate(args, str(log_dir), data_path, saved)
+        return summary
+
     def _collect_results(self, task: EvolutionTask, log_dir: Path) -> dict[str, Any]:
         """Collect results from result.json or log dir."""
         result_file = log_dir / "result.json"
-        if result_file.exists():
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(result_file, flags)
+        except FileNotFoundError:
+            fd = None
+        except OSError as exc:
+            raise RuntimeError(f"Cannot safely open runner result: {exc}") from exc
+        if fd is not None:
             try:
-                return json.loads(result_file.read_text())
-            except Exception:
-                pass
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_size > 32 * 1024 * 1024:
+                    raise RuntimeError("Runner result is not a regular file or exceeds 32 MiB")
+                with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                    fd = -1
+                    result = json.load(handle)
+                if not isinstance(result, dict):
+                    raise RuntimeError("Runner result must be a JSON object")
+                return result
+            except Exception as exc:
+                raise RuntimeError(f"Invalid runner result: {exc}") from exc
+            finally:
+                if fd not in (None, -1):
+                    os.close(fd)
+        if task.algorithm == "rdagent":
+            raise RuntimeError("RD-Agent runner exited without writing result.json")
         return {
             "total_factors": 0,
             "log_dir": str(log_dir),
             "task_id": task.task_id,
             "market": task.market,
-            "message": "Factors persisted to DB by runner script",
+            "message": "Runner did not produce result.json",
         }
 
     @staticmethod

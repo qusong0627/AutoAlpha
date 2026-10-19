@@ -546,13 +546,14 @@ def _execute_factor_code(
     if not panel_path.is_file():
         raise RuntimeError(f"panel.parquet 不存在: {panel_path}")
     migrated, _ = migrate_legacy_code(str(factor_code))
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        raise RuntimeError("bubblewrap is required to execute mined factor code")
     with tempfile.TemporaryDirectory(prefix="rd_mined_exec_") as tmp:
         tmp_dir = Path(tmp)
-        link = tmp_dir / "panel.parquet"
-        try:
-            os.symlink(str(panel_path.resolve()), link)
-        except OSError:
-            shutil.copy2(panel_path, link)
+        output_dir = tmp_dir / "output"
+        output_dir.mkdir(mode=0o700)
+        sandbox_result = output_dir / "result.parquet"
         sdk_src = (
             _project_root
             / "backend"
@@ -561,24 +562,73 @@ def _execute_factor_code(
             / "rd_agent"
             / "quantdb_data.py"
         )
-        try:
-            os.symlink(str(sdk_src), tmp_dir / "quantdb_data.py")
-        except OSError:
-            shutil.copy2(sdk_src, tmp_dir / "quantdb_data.py")
         script = tmp_dir / "_run_factor.py"
         script.write_text(_RUNNER_SOURCE, encoding="utf-8")
-        env = dict(os.environ)
-        env["RDM_FACTOR_CODE"] = migrated
-        env["RDM_OUT_PARQUET"] = str(out_parquet)
-        env["QUANTDB_PANEL_PATH"] = str(link)
+        panel_source = panel_path.resolve(strict=True)
+        if not panel_source.is_file():
+            raise RuntimeError(f"panel.parquet is not a regular file: {panel_source}")
+        sandbox_args = [
+            bwrap,
+            "--die-with-parent",
+            "--unshare-all",
+            "--ro-bind", "/", "/",
+            "--proc", "/proc",
+            "--dev", "/dev",
+            "--tmpfs", "/run",
+            "--tmpfs", "/tmp",
+            "--tmpfs", "/home",
+            "--tmpfs", "/root",
+            "--dir", "/tmp/factor_exec",
+            "--dir", "/tmp/factor_exec/work",
+            "--dir", "/tmp/factor_exec/output",
+            "--ro-bind", str(script), "/tmp/factor_exec/_run_factor.py",
+            "--ro-bind", str(sdk_src), "/tmp/factor_exec/quantdb_data.py",
+            "--ro-bind", str(panel_source), "/tmp/factor_exec/panel.parquet",
+            "--bind", str(output_dir), "/tmp/factor_exec/output",
+        ]
+        private_env_candidates = [
+            _project_root / "config" / "runtime.env",
+            Path.home() / ".config" / "autoalpha" / "runtime.env",
+        ]
+        for private_env in private_env_candidates:
+            try:
+                private_env = private_env.resolve(strict=True)
+                if private_env.is_file() and not private_env.is_relative_to(Path("/home")):
+                    sandbox_args.extend(["--ro-bind", "/dev/null", str(private_env)])
+            except OSError:
+                continue
+        venv = Path(sys.prefix).resolve()
+        home_root = Path("/home")
+        if venv.is_relative_to(home_root):
+            current = home_root
+            for part in venv.parent.relative_to(home_root).parts:
+                current = current / part
+                sandbox_args.extend(["--dir", str(current)])
+            sandbox_args.extend(["--ro-bind", str(venv), str(venv)])
+        sandbox_args.extend(
+            [
+                "--chdir", "/tmp/factor_exec/work",
+                "--clearenv",
+                "--setenv", "HOME", "/tmp",
+                "--setenv", "TMPDIR", "/tmp",
+                "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin",
+                "--setenv", "PYTHONDONTWRITEBYTECODE", "1",
+                "--setenv", "QUANTDB_PANEL_PATH", "/tmp/factor_exec/panel.parquet",
+                "--setenv", "RDM_OUT_PARQUET", "/tmp/factor_exec/output/result.parquet",
+                "--setenv", "RDM_FACTOR_CODE", migrated,
+                "--",
+                sys.executable,
+                "/tmp/factor_exec/_run_factor.py",
+            ]
+        )
         try:
             proc = subprocess.run(
-                [sys.executable, str(script)],
+                sandbox_args,
                 cwd=str(tmp_dir),
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                env=env,
+                env={"PATH": os.getenv("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8"},
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(f"因子代码执行超时（{timeout}s）") from exc
@@ -593,8 +643,10 @@ def _execute_factor_code(
         if proc.returncode != 0 or rows is None:
             tail = "\n".join(output.strip().splitlines()[-6:])
             raise RuntimeError(f"因子代码执行失败（rc={proc.returncode}）：{tail}")
-        if not out_parquet.is_file():
+        if not sandbox_result.is_file():
             raise RuntimeError("执行声称成功但输出 parquet 缺失")
+        out_parquet.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(sandbox_result, out_parquet)
         return rows
 
 
@@ -1211,7 +1263,7 @@ async def _register_library(lib_root: Path, *, force: bool = False) -> str | Non
         logger.info("rd_mined 无分区，跳过目录注册")
         return None
     reader = QuantDBFactorReader(market=LIB_MARKET)
-    status = reader.describe(RD_MINED_SOURCE)
+    status = reader.describe(RD_MINED_SOURCE, allow_materializing=True)
     factor_cols = [
         str(c)
         for c in status.columns
@@ -1282,6 +1334,58 @@ def _lock_path() -> Path:
     if override:
         return Path(override)
     return Path(tempfile.gettempdir()) / "_rd_mined_materialize.lock"
+
+
+def _materialization_marker(lib_root: Path) -> Path:
+    from backend.services.engine.data_platform.quantdb_factor_reader import (
+        RD_MINED_MATERIALIZATION_MARKER,
+    )
+
+    return lib_root / RD_MINED_MATERIALIZATION_MARKER
+
+
+def _begin_materialization(lib_root: Path) -> bool:
+    """Make an interrupted/in-progress library unreadable until a clean pass finishes.
+
+    The marker intentionally survives exceptions and process crashes. A subsequent
+    run must explicitly force a full rebuild before data readers are re-enabled.
+    Returns True when resuming an existing marker.
+    """
+    lib_root.mkdir(parents=True, exist_ok=True)
+    marker = _materialization_marker(lib_root)
+    if marker.is_symlink():
+        raise RuntimeError(f"拒绝使用符号链接物化标记: {marker}")
+    if marker.exists():
+        if not marker.is_file():
+            raise RuntimeError(f"物化标记不是普通文件: {marker}")
+        return True
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(marker, flags, 0o600)
+    except FileExistsError:
+        if marker.is_symlink() or not marker.is_file():
+            raise RuntimeError(f"并发创建了无效物化标记: {marker}")
+        return True
+    try:
+        if os.name == "posix":
+            os.fchmod(fd, 0o600)
+        payload = f"pid={os.getpid()} started_at={_now_iso()}\n".encode("ascii")
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return False
+
+
+def _finish_materialization(lib_root: Path) -> None:
+    marker = _materialization_marker(lib_root)
+    if marker.is_symlink():
+        raise RuntimeError(f"物化标记在运行期间被替换为符号链接: {marker}")
+    if marker.exists():
+        if not marker.is_file():
+            raise RuntimeError(f"物化标记不是普通文件: {marker}")
+        marker.unlink()
 
 
 def _acquire_run_lock() -> Any | None:
@@ -1503,11 +1607,31 @@ async def _run(args: argparse.Namespace) -> int:
     if lock is None:
         logger.warning("另一个物化进程正在运行，本次跳过（避免并发写同一座库）")
         return 0
+    marker = _materialization_marker(lib_root)
+    recovering = marker.exists()
+    if marker.is_symlink() or (recovering and not marker.is_file()):
+        logger.error("物化不完整标记路径无效，拒绝读写: %s", marker)
+        return 2
+    if recovering and (
+        not args.force
+        or args.task_id
+        or args.factor_ids
+        or args.limit
+        or args.align_only
+        or args.gates_only
+    ):
+        logger.error(
+            "rd_mined 上次物化未完整结束；读取已被禁用。恢复必须运行全量 "
+            "--force（不得指定 --task-id/--factor-ids/--limit/--align-only/--gates-only）。"
+        )
+        return 2
     if args.gates_only:
         return await _run_gates_only(args)
     if args.align_only:
+        _begin_materialization(lib_root)
         report = _align_partition_schemas(lib_root)
         logger.info("分区 schema 对齐：%s", report)
+        _finish_materialization(lib_root)
         return 0
 
     rows = await _load_candidates(args)
@@ -1530,6 +1654,12 @@ async def _run(args: argparse.Namespace) -> int:
         else:
             skipped[reason] = skipped.get(reason, 0) + 1
     logger.info("候选 %d：待物化 %d，跳过 %s", len(rows), len(todo), skipped or "无")
+    if recovering and not todo:
+        logger.error(
+            "rd_mined 有未完成标记，但全量 --force 未找到可重建因子；"
+            "保留标记并拒绝注册/读取。"
+        )
+        return 2
     owners = _column_owners(manifest)
     if args.dry_run:
         for row in todo[:50]:
@@ -1553,6 +1683,10 @@ async def _run(args: argparse.Namespace) -> int:
         return 0
     if not todo and not args.register:
         return 0
+
+    marker_started = bool(todo)
+    if marker_started:
+        _begin_materialization(lib_root)
 
     stats = {
         "materialized": 0,
@@ -1899,11 +2033,20 @@ async def _run(args: argparse.Namespace) -> int:
         report = _align_partition_schemas(lib_root)
         logger.info("分区 schema 对齐：%s", report)
     if args.register:
-        try:
-            await _register_library(lib_root, force=args.force_register)
-        except Exception as exc:  # noqa: BLE001 - 注册失败不影响已物化数据
-            logger.exception("目录注册失败：%s", exc)
-            stats["errors"] += 1
+        if stats["errors"]:
+            logger.error(
+                "本轮有 %d 个错误，跳过目录注册；rd_mined 保持不可读，"
+                "请使用全量 --force 恢复后再发布。",
+                stats["errors"],
+            )
+        else:
+            try:
+                await _register_library(lib_root, force=args.force_register)
+            except Exception as exc:  # noqa: BLE001 - 注册失败不影响已物化数据
+                logger.exception("目录注册失败：%s", exc)
+                stats["errors"] += 1
+    if marker_started and stats["errors"] == 0:
+        _finish_materialization(lib_root)
     logger.info("汇总：%s", stats)
     return 0 if stats["errors"] == 0 else 1
 

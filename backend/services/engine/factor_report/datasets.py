@@ -136,7 +136,14 @@ def dataset_names() -> list[str]:
 
 def dataset_dir(dataset: str) -> Path:
     cfg = DATASETS.get(dataset) or DATASETS[DEFAULT_DATASET]
-    return resolve_quantdb_subdir(*cfg["dir_parts"])
+    root = resolve_quantdb_subdir(*cfg["dir_parts"])
+    marker = root / ".materialization-incomplete"
+    if dataset == "rd_mined" and (marker.exists() or marker.is_symlink()):
+        raise RuntimeError(
+            "rd_mined materialization is incomplete; report reads are blocked "
+            "until a full recovery run succeeds"
+        )
+    return root
 
 
 def label_dir(dataset: str) -> Path | None:

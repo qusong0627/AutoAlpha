@@ -1,8 +1,15 @@
 """RD-Agent 因子管理 REST API"""
 
 import asyncio
+import json
 import logging
-from typing import Any, Optional
+import math
+import os
+import signal
+import stat
+import sys
+from datetime import date
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
@@ -21,6 +28,7 @@ persistence = RDAgentFactorPersistence()
 
 # 跟踪在跑的轻量回测，防止重复触发
 _running_backtests: set[str] = set()
+_MAX_LIGHTWEIGHT_BACKTESTS = 1
 
 
 async def _require_owned_factor(factor_id: str, request: Request) -> dict:
@@ -63,11 +71,14 @@ async def get_factor(factor_id: str, request: Request):
 async def backtest_factor(
     factor_id: str,
     request: Request,
-    start_date: str | None = None,
-    end_date: str | None = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
 ):
     """对 RD-Agent 因子发起轻量验证（异步跑 IC/夏普，回填到因子表）"""
     factor = await _require_owned_factor(factor_id, request)
+
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(status_code=422, detail="开始日期不能晚于结束日期")
 
     if not factor.get("factor_code"):
         raise HTTPException(status_code=400, detail="因子代码为空，无法回测")
@@ -81,13 +92,27 @@ async def backtest_factor(
                 "message": "回测已在进行中",
             },
         }
+    if len(_running_backtests) >= _MAX_LIGHTWEIGHT_BACKTESTS:
+        raise HTTPException(
+            status_code=429,
+            detail="轻量回测正在运行，请等待当前任务完成后重试。",
+        )
 
-    await persistence.update_factor_metrics(factor_id, status="backtesting")
     _running_backtests.add(factor_id)
+    try:
+        await persistence.update_factor_metrics(factor_id, status="backtesting")
+    except Exception:
+        _running_backtests.discard(factor_id)
+        raise
 
     # 后台异步执行，避免接口阻塞
     asyncio.create_task(
-        _run_lightweight_backtest(factor_id, factor.get("factor_code") or "", start_date, end_date)
+        _run_lightweight_backtest(
+            factor_id,
+            factor.get("factor_code") or "",
+            start_date.isoformat() if start_date else None,
+            end_date.isoformat() if end_date else None,
+        )
     )
 
     return {
@@ -106,96 +131,254 @@ async def _run_lightweight_backtest(
     start_date: str | None,
     end_date: str | None,
 ) -> None:
-    """轻量回测：execfile 因子代码 → 用 Qlib 数据算 IC/夏普回填"""
+    """Run untrusted factor code in an isolated process and persist its metrics."""
     try:
-        import numpy as np
-        import pandas as pd
-        from qlib.data import D
-
-        # 1) 加载因子代码，找出 Factor 类
-        ns: dict[str, Any] = {}
-        exec(compile(factor_code, f"<rd-factor-{factor_id}>", "exec"), ns)
-
-        factor_cls = None
-        for v in ns.values():
-            if isinstance(v, type) and callable(v) and v.__module__ == "builtins":
-                if getattr(v, "name", None) or v.__name__.lower().endswith("factor"):
-                    factor_cls = v
-                    break
-        if factor_cls is None:
-            raise RuntimeError("因子代码中未找到可调用的 Factor 类")
-
-        # 2) 取 1 年沪深 300 数据做样本
-        end = end_date or "2024-12-31"
-        start = start_date or "2024-01-01"
-        instruments = D.instruments(market="csi300")
-        fields = ["$open", "$high", "$low", "$close", "$volume", "$factor"]
-        df = D.features(instruments, fields, start_time=start, end_time=end, freq="day")
-        if df.empty:
-            raise RuntimeError("Qlib 数据为空，请检查 QLIB_PROVIDER_URI")
-
-        # 3) 跑因子
-        factor_inst = factor_cls()
-        sample_codes = df.index.get_level_values(0).unique()[:50]
-        ic_list: list[float] = []
-        ret_list: list[float] = []
-
-        for code in sample_codes:
-            sub = df.xs(code, level=0).copy()
-            if len(sub) < 30:
-                continue
-            try:
-                fv = factor_inst(sub)
-                fv_col = fv.iloc[:, 0] if hasattr(fv, "iloc") else pd.Series(fv)
-            except Exception:
-                continue
-            fwd_ret = sub["$close"].pct_change(5).shift(-5)
-            paired = pd.concat([fv_col, fwd_ret], axis=1).dropna()
-            if len(paired) < 10:
-                continue
-            ic = paired.iloc[:, 0].corr(paired.iloc[:, 1])
-            if np.isfinite(ic):
-                ic_list.append(float(ic))
-            # 简单分组：因子 top 30% 等权多头
-            cutoff = fv_col.quantile(0.7)
-            longs = fwd_ret[fv_col >= cutoff].dropna()
-            if len(longs) > 0:
-                ret_list.append(float(longs.mean()))
-
-        if not ic_list:
-            raise RuntimeError("所有股票都无法计算 IC，因子可能与数据列不匹配")
-
-        ic_mean = float(np.mean(ic_list))
-        sharpe = (
-            float(np.mean(ret_list) / (np.std(ret_list) + 1e-8) * np.sqrt(252))
-            if ret_list else None
+        metrics = await _calculate_lightweight_metrics_sandboxed(
+            factor_code, start_date, end_date
         )
-        annual_return = float(np.mean(ret_list) * 252) if ret_list else None
 
         await persistence.update_factor_metrics(
             factor_id,
             status="completed",
-            ic_value=ic_mean,
-            sharpe_ratio=sharpe,
-            annual_return=annual_return,
+            ic_value=metrics["ic_value"],
+            sharpe_ratio=metrics["sharpe_ratio"],
+            annual_return=metrics["annual_return"],
         )
         logger.info(
             "[rd-backtest] %s done ic=%.4f sharpe=%s",
-            factor_id, ic_mean, f"{sharpe:.3f}" if sharpe is not None else "N/A",
+            factor_id,
+            metrics["ic_value"],
+            f"{metrics['sharpe_ratio']:.3f}"
+            if metrics["sharpe_ratio"] is not None else "N/A",
         )
 
     except Exception as exc:
-        logger.exception("[rd-backtest] %s failed", factor_id)
+        # The child executes untrusted code. Its exception text may contain
+        # readable file contents, so log only the exception class.
+        logger.error("[rd-backtest] %s failed (%s)", factor_id, type(exc).__name__)
         try:
             await persistence.update_factor_metrics(
                 factor_id,
                 status="failed",
-                metadata={"backtest_error": str(exc)[:500]},
+                metadata={"backtest_error": f"隔离回测失败 ({type(exc).__name__})"},
             )
         except Exception:
             pass
     finally:
         _running_backtests.discard(factor_id)
+
+
+async def _terminate_lightweight_process_group(process) -> None:
+    """Stop the sandbox session even if its leader exited before descendants."""
+    pgid = process.pid  # create_subprocess_exec uses start_new_session=True
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        if process.returncode is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+    except OSError:
+        if process.returncode is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+
+    await asyncio.sleep(0.1)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+    except OSError:
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+    if process.returncode is None:
+        await process.wait()
+
+
+async def _calculate_lightweight_metrics_sandboxed(
+    factor_code: str,
+    start_date: str | None,
+    end_date: str | None,
+) -> dict[str, float | None]:
+    """Run a stored Factor class with no credentials/network and bounded result IO."""
+    if not isinstance(factor_code, str) or not factor_code.strip():
+        raise ValueError("因子代码为空")
+    if len(factor_code.encode("utf-8")) > 256 * 1024:
+        raise ValueError("因子代码超过 256 KiB 限制")
+
+    # Use the same fail-closed bubblewrap policy as the other factor execution paths.
+    from backend.services.engine.routers.alpha_agent import (
+        _factor_child_env,
+        _factor_sandbox_command,
+        _new_factor_workspace,
+        _remove_factor_workspace,
+    )
+
+    workspace = _new_factor_workspace(prefix="rd_lightbacktest_")
+    factor_path = Path(workspace) / "factor.py"
+    result_path = Path(workspace) / "metrics.json"
+    child_script = f"""
+import json, os, resource
+resource.setrlimit(resource.RLIMIT_CPU, (240, 240))
+resource.setrlimit(resource.RLIMIT_FSIZE, (32 * 1024 * 1024, 32 * 1024 * 1024))
+if hasattr(resource, "RLIMIT_NPROC"):
+    resource.setrlimit(resource.RLIMIT_NPROC, (128, 128))
+if hasattr(os, "sched_getaffinity") and hasattr(os, "sched_setaffinity"):
+    allowed_cpus = os.sched_getaffinity(0)
+    if allowed_cpus:
+        os.sched_setaffinity(0, {{min(allowed_cpus)}})
+os.chdir({workspace!r})
+import numpy as np
+import pandas as pd
+import qlib
+from qlib.data import D
+
+provider_uri = os.environ.get("QLIB_PROVIDER_URI")
+if not provider_uri:
+    raise RuntimeError("Qlib provider is not configured")
+qlib.init(provider_uri=provider_uri, region="cn", kernels=1)
+
+namespace = {{}}
+with open({str(factor_path)!r}, "r", encoding="utf-8") as source:
+    untrusted_source = source.read(256 * 1024 + 1)
+if len(untrusted_source.encode("utf-8")) > 256 * 1024:
+    raise RuntimeError("Factor source exceeds limit")
+exec(compile(untrusted_source, "<rd-agent-factor>", "exec"), namespace)
+factor_cls = next((value for value in namespace.values()
+                   if isinstance(value, type) and value.__module__ == "builtins"
+                   and (getattr(value, "name", None)
+                        or value.__name__.lower().endswith("factor"))), None)
+if factor_cls is None:
+    raise RuntimeError("Factor class not found")
+
+end = {(end_date or "2024-12-31")!r}
+start = {(start_date or "2024-01-01")!r}
+instruments = D.instruments(market="csi300")
+fields = ["$open", "$high", "$low", "$close", "$volume", "$factor"]
+df = D.features(instruments, fields, start_time=start, end_time=end, freq="day")
+if df.empty:
+    raise RuntimeError("Qlib returned no data")
+
+factor_inst = factor_cls()
+ic_list, ret_list = [], []
+for code in df.index.get_level_values(0).unique()[:50]:
+    sub = df.xs(code, level=0).copy()
+    if len(sub) < 30:
+        continue
+    try:
+        fv = factor_inst(sub)
+        fv_col = fv.iloc[:, 0] if hasattr(fv, "iloc") else pd.Series(fv)
+    except Exception:
+        continue
+    fwd_ret = sub["$close"].pct_change(5).shift(-5)
+    paired = pd.concat([fv_col, fwd_ret], axis=1).dropna()
+    if len(paired) < 10:
+        continue
+    ic = paired.iloc[:, 0].corr(paired.iloc[:, 1])
+    if np.isfinite(ic):
+        ic_list.append(float(ic))
+    cutoff = fv_col.quantile(0.7)
+    longs = fwd_ret[fv_col >= cutoff].dropna()
+    if len(longs) > 0:
+        ret_list.append(float(longs.mean()))
+
+if not ic_list:
+    raise RuntimeError("No valid IC values")
+ic_mean = float(np.mean(ic_list))
+sharpe = (float(np.mean(ret_list) / (np.std(ret_list) + 1e-8) * np.sqrt(252))
+          if ret_list else None)
+annual_return = float(np.mean(ret_list) * 252) if ret_list else None
+with open({str(result_path)!r}, "x", encoding="utf-8") as output:
+    json.dump({{"ic_value": ic_mean, "sharpe_ratio": sharpe,
+               "annual_return": annual_return}}, output, allow_nan=False)
+"""
+
+    process = None
+    try:
+        factor_path.write_text(factor_code, encoding="utf-8")
+        child_env = _factor_child_env()
+        # One Qlib worker is intentional; keep numerical runtimes from creating
+        # a CPU-count-sized thread pool inside the bounded process sandbox.
+        for variable in (
+            "OMP_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+        ):
+            child_env[variable] = "1"
+        command = _factor_sandbox_command(
+            [sys.executable, "-c", child_script], child_env, [workspace]
+        )
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            env=child_env,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        await asyncio.wait_for(process.wait(), timeout=300)
+        await _terminate_lightweight_process_group(process)
+        if process.returncode != 0:
+            raise RuntimeError("隔离回测子进程失败")
+
+        workspace_path = Path(workspace)
+        if workspace_path.is_symlink() or not workspace_path.is_dir():
+            raise RuntimeError("隔离回测工作目录无效")
+        result_fd = os.open(
+            result_path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            result_stat = os.fstat(result_fd)
+            if not stat.S_ISREG(result_stat.st_mode) or result_stat.st_size > 16 * 1024:
+                raise RuntimeError("隔离回测结果文件无效")
+            raw_result = os.read(result_fd, 16 * 1024 + 1)
+        finally:
+            os.close(result_fd)
+        if len(raw_result) > 16 * 1024:
+            raise RuntimeError("隔离回测结果过大")
+        payload = json.loads(raw_result)
+        if not isinstance(payload, dict):
+            raise RuntimeError("隔离回测结果结构无效")
+
+        ic_value = payload.get("ic_value")
+        sharpe_ratio = payload.get("sharpe_ratio")
+        annual_return = payload.get("annual_return")
+        if not isinstance(ic_value, (int, float)) or not math.isfinite(ic_value):
+            raise RuntimeError("隔离回测 IC 结果无效")
+        for value in (sharpe_ratio, annual_return):
+            if value is not None and (
+                not isinstance(value, (int, float)) or not math.isfinite(value)
+            ):
+                raise RuntimeError("隔离回测收益指标无效")
+        return {
+            "ic_value": float(ic_value),
+            "sharpe_ratio": float(sharpe_ratio) if sharpe_ratio is not None else None,
+            "annual_return": float(annual_return) if annual_return is not None else None,
+        }
+    except BaseException:
+        if process is not None:
+            try:
+                await _terminate_lightweight_process_group(process)
+            except Exception as exc:
+                logger.warning(
+                    "lightweight backtest process cleanup failed (%s)",
+                    type(exc).__name__,
+                )
+        raise
+    finally:
+        _remove_factor_workspace(workspace)
 
 
 @router.get("/stats")

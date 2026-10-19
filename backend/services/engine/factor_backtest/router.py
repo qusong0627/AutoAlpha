@@ -17,8 +17,8 @@
 
 纪律（与旧回测链共存的边界）：
 - 去重与取消**共享** ``alpha_agent`` 的 ``_running_backtests``/
-  ``_backtest_processes``/``_backtest_cancelled``——子进程登记按 factor_id 键，
-  新旧两条链必须全局串行；旧 UI 的取消也能 kill 新链的子进程（反向亦然）。
+  ``_backtest_processes``/``_backtest_cancelled``——子进程按 ``run_id`` 登记，
+  factor_id 只负责找到当前 run；旧式无 run_id 调用保留兼容回退。
 - 新链**绝不更新 rd_agent_factors 行**：因子库指标是 CN 语义，跨市场结果只进
   台账 + 序列表。
 - 后台任务用 ``asyncio.create_task``（engine 常驻进程内）＋测试挂桩点
@@ -54,12 +54,14 @@ from backend.services.engine.factor_backtest.profiles import (
 from backend.services.engine.routers.alpha_agent import (
     FactorBacktestCancelled,
     _backtest_cancelled,
-    _backtest_processes,
     _detect_factor_kind,
     _format_backtest_error,
+    backtest_run_scope,
+    get_backtest_process,
     _require_owned_factor,
     _running_backtest_runs,
     _running_backtests,
+    terminate_backtest_process,
 )
 
 logger = logging.getLogger(__name__)
@@ -118,26 +120,13 @@ def _spawn_backtest_run(coro) -> None:
     asyncio.create_task(coro)
 
 
-def _kill_backtest_process(factor_id: str) -> None:
-    """kill 该因子在跑的子进程（terminate → 等 2s → kill）。"""
-    proc = _backtest_processes.get(factor_id)
+async def _kill_backtest_process(factor_id: str, run_id: str | None = None) -> None:
+    """Terminate the sandbox process group without blocking the event loop."""
+    proc = get_backtest_process(factor_id, run_id)
     if not proc or proc.poll() is not None:
         return
     try:
-        proc.terminate()
-        for _ in range(10):
-            if proc.poll() is not None:
-                break
-            import time
-
-            time.sleep(0.2)  # noqa: ASYNC251 — 由取消端点在线程侧短等，最长 2s
-        if proc.poll() is None:
-            proc.kill()
-            logger.warning(
-                "[factor-backtest] force-killed subprocess for %s", factor_id
-            )
-    except ProcessLookupError:
-        pass
+        await terminate_backtest_process(proc)
     except Exception as e:  # noqa: BLE001
         logger.warning("[factor-backtest] cancel kill %s failed: %s", factor_id, e)
 
@@ -261,8 +250,8 @@ async def cancel_single_backtest(factor_id: str, request: Request):
             },
         }
     _backtest_cancelled.add(factor_id)
-    _kill_backtest_process(factor_id)
     run_id = _running_backtest_runs.get(factor_id)
+    await _kill_backtest_process(factor_id, run_id)
     if run_id:
         try:
             await store.finish_run(run_id, "cancelled", error="cancelled_by_user")
@@ -292,14 +281,15 @@ async def evaluate_and_record(
     （路由后台任务吞掉，验证脚本据此降级报告）。
     """
     try:
-        res = await evaluate_factor_market(
-            factor,
-            market=market,
-            universe=universe,
-            start=start,
-            end=end,
-            cost_bps=cost_bps,
-        )
+        with backtest_run_scope(factor_id, run_id):
+            res = await evaluate_factor_market(
+                factor,
+                market=market,
+                universe=universe,
+                start=start,
+                end=end,
+                cost_bps=cost_bps,
+            )
         win = res.get("window") or {}
         date_range = (
             f"{win.get('start')}~{win.get('end')}" if win.get("start") else None
