@@ -34,9 +34,9 @@ foreach ($p in @(
 }
 
 Write-Output ""
-Write-Output "== /api proxy (backend auth disabled) =="
+Write-Output "== health + /api proxy (backend auth disabled) =="
 foreach ($p in @(
-    '/backend-health',
+    '/health',
     '/api/v1/alpha-agent/tasks/history',
     '/api/v1/alpha-agent/data-summary',
     '/api/v1/alpha-agent/factors?limit=1',

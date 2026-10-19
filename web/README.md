@@ -15,7 +15,7 @@ npm.cmd run build
 powershell -File D:\git\autoalpha\scripts\web-smoke.ps1
 ```
 
-开发地址为 `http://localhost:3000`。Vite 将 `/api` 代理到独立后端，将 `/backend-health` 代理到 `/health`。生产构建位于 `web/dist`；部署时需由同域反向代理转发这两组请求。
+开发地址为 `http://localhost:3000`。Vite 将 `/api` 和 `/health` 代理到独立后端。生产构建位于 `web/dist`；将其放在仓库的 `web/dist` 后，独立后端可在同一端口提供页面、静态资源、`/health` 和 `/api`，无需 Vite dev server。
 
 ## 主页面
 

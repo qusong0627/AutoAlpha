@@ -20,11 +20,11 @@ export function SpecPanel({ title, note, icon, items, columns }: { title: ReactN
 }
 /** The original three-card group: icon, coloured tag, title, blurb, action link. */
 export function CardGrid({ cards, columns = 3 }: { cards: { icon: ReactNode; tag?: string; color?: string; title: string; description?: ReactNode; link?: string; onClick?: () => void }[]; columns?: 2 | 3 | 4 }) {
-  return <div className={`card-grid cols-${columns}`}>{cards.map(card => <div className="card" key={card.title} onClick={card.onClick} style={card.onClick ? { cursor: 'pointer' } : undefined}>
+  return <div className={`card-grid cols-${columns}`}>{cards.map(card => <div className="card" key={card.title} role={card.onClick ? 'button' : undefined} tabIndex={card.onClick ? 0 : undefined} onClick={card.onClick} onKeyDown={card.onClick ? event => { if (event.target === event.currentTarget && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); card.onClick?.(); } } : undefined} style={card.onClick ? { cursor: 'pointer' } : undefined}>
     <div className="card-top"><span className="card-icon" style={card.color ? { color: card.color, background: `${card.color}12`, borderColor: `${card.color}26` } : undefined}>{card.icon}</span>{card.tag && <span className="card-tag" style={card.color ? { color: card.color, background: `${card.color}14` } : undefined}>{card.tag}</span>}</div>
     <strong>{card.title}</strong>
     {card.description && <p>{card.description}</p>}
-    {card.link && <div className="card-footer"><button type="button" className="card-link" style={card.color ? { color: card.color } : undefined} onClick={e => { e.stopPropagation(); card.onClick?.(); }}>{card.link}</button></div>}
+    {card.link && <div className="card-footer"><span className="card-link" style={card.color ? { color: card.color } : undefined}>{card.link}</span></div>}
   </div>)}</div>;
 }
 export function Panel({ title, extra, children, className = '' }: { title?: ReactNode; extra?: ReactNode; children: ReactNode; className?: string }) {
@@ -82,14 +82,56 @@ export function CopyButton({ text }: { text: string }) {
 export function CopyableBlock({ text, className }: { text: string; className: string }) {
   return <div className="copyable-content"><div className="copyable-toolbar"><CopyButton text={text} /></div><div className={className}>{text}</div></div>;
 }
-function stringifyDisplay(value: unknown, depth = 0): string {
-  if (typeof value === 'number') return Number.isInteger(value) ? String(value) : value.toFixed(2);
-  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
-  const indent = '  '.repeat(depth);
-  const childIndent = '  '.repeat(depth + 1);
-  if (Array.isArray(value)) return value.length ? `[\n${value.map(item => `${childIndent}${stringifyDisplay(item, depth + 1)}`).join(',\n')}\n${indent}]` : '[]';
-  const entries = Object.entries(value as Row);
-  return entries.length ? `{\n${entries.map(([key, item]) => `${childIndent}${JSON.stringify(key)}: ${stringifyDisplay(item, depth + 1)}`).join(',\n')}\n${indent}}` : '{}';
+function stringifyDisplay(value: unknown): string {
+  const maxDepth = 8;
+  const maxNodes = 500;
+  const maxEntries = 100;
+  const maxStringLength = 2048;
+  const maxOutputLength = 50_000;
+  let nodesLeft = maxNodes;
+  const seen = new WeakSet<object>();
+
+  const visit = (item: unknown, depth: number): string => {
+    nodesLeft -= 1;
+    if (nodesLeft < 0) return '"[truncated: node limit]"';
+    if (typeof item === 'string') {
+      const clipped = item.length > maxStringLength ? `${item.slice(0, maxStringLength)}…` : item;
+      return JSON.stringify(clipped);
+    }
+    if (typeof item === 'number') return Number.isInteger(item) ? String(item) : item.toFixed(2);
+    if (typeof item === 'bigint') return JSON.stringify(item.toString());
+    if (item === null || typeof item !== 'object') return JSON.stringify(item) ?? 'null';
+    if (seen.has(item)) return '"[circular reference]"';
+    if (depth >= maxDepth) return '"[truncated: depth limit]"';
+    seen.add(item);
+
+    const indent = '  '.repeat(depth);
+    const childIndent = '  '.repeat(depth + 1);
+    if (Array.isArray(item)) {
+      const values = item.slice(0, maxEntries).map(child => `${childIndent}${visit(child, depth + 1)}`);
+      if (item.length > maxEntries) values.push(`${childIndent}"[truncated: entry limit]"`);
+      return values.length ? `[\n${values.join(',\n')}\n${indent}]` : '[]';
+    }
+
+    const lines: string[] = [];
+    let entryCount = 0;
+    let hasMoreEntries = false;
+    for (const key in item) {
+      if (!Object.prototype.hasOwnProperty.call(item, key)) continue;
+      if (entryCount >= maxEntries) {
+        hasMoreEntries = true;
+        break;
+      }
+      entryCount += 1;
+      const clippedKey = key.length > 256 ? `${key.slice(0, 256)}…` : key;
+      lines.push(`${childIndent}${JSON.stringify(clippedKey)}: ${visit((item as Row)[key], depth + 1)}`);
+    }
+    if (hasMoreEntries) lines.push(`${childIndent}"[truncated: entry limit]": true`);
+    return lines.length ? `{\n${lines.join(',\n')}\n${indent}}` : '{}';
+  };
+
+  const result = visit(value, 0);
+  return result.length > maxOutputLength ? `${result.slice(0, maxOutputLength)}\n…（内容已截断）` : result;
 }
 export function JsonDetails({ data, label = '查看详细结果' }: { data: unknown; label?: string }) {
   const text = stringifyDisplay(data);
@@ -147,5 +189,5 @@ export function CurveChart({ series, title = '净值曲线', kind = 'nav' }: { s
   }
   if (!traces.length) return <JsonDetails data={series} label="查看曲线数据" />;
   const percent = kind === 'returns';
-  return <div className="chart" aria-label={title}><Suspense fallback={<Skeleton active paragraph={{ rows: 5 }} />}><ReactECharts style={{ height: 320 }} option={{ color: CHART_PALETTE, tooltip: { trigger: 'axis', valueFormatter: (value: unknown) => typeof value === 'number' ? (percent ? `${value.toFixed(2)}%` : number(value)) : String(value) }, legend: { bottom: 0 }, grid: { left: 60, right: 25, top: 30, bottom: 55 }, xAxis: { type: 'category', name: '日期', data: dates }, yAxis: { type: 'value', name: percent ? '累计收益（%）' : kind === 'ic' ? '相关系数' : kind === 'turnover' ? '换手率' : '净值', scale: kind !== 'ic', axisLabel: { formatter: (value: number) => (percent ? `${value}%` : number(value)) } }, series: traces }} /></Suspense></div>;
+  return <div className="chart" role="img" aria-label={title}><Suspense fallback={<Skeleton active paragraph={{ rows: 5 }} />}><ReactECharts style={{ height: 320 }} option={{ color: CHART_PALETTE, tooltip: { trigger: 'axis', valueFormatter: (value: unknown) => typeof value === 'number' ? (percent ? `${value.toFixed(2)}%` : number(value)) : String(value) }, legend: { bottom: 0 }, grid: { left: 60, right: 25, top: 30, bottom: 55 }, xAxis: { type: 'category', name: '日期', data: dates }, yAxis: { type: 'value', name: percent ? '累计收益（%）' : kind === 'ic' ? '相关系数' : kind === 'turnover' ? '换手率' : '净值', scale: kind !== 'ic', axisLabel: { formatter: (value: number) => (percent ? `${value}%` : number(value)) } }, series: traces }} /></Suspense></div>;
 }

@@ -19,5 +19,5 @@
     "paths": { "@/*": ["src/*"] },
     "types": ["vite/client", "node"]
   },
-  "include": ["src"]
+  "include": ["src/main.tsx"]
 }
