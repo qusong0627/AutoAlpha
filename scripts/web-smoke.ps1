@@ -1,7 +1,7 @@
 # Smoke test for the slim factor-mining frontend (ASCII only:
 # PowerShell 5.1 reads .ps1 as ANSI, non-ASCII breaks parsing).
 $ErrorActionPreference = 'Continue'
-$FE = 'http://127.0.0.1:3000'
+$FE = 'http://127.0.0.1:1688'
 $tmp = $env:TEMP
 
 function Probe($url, $out, $timeout = 60) {
@@ -20,12 +20,7 @@ foreach ($p in @(
     '/src/workspace/MiningForm.tsx',
     '/src/workspace/TasksPage.tsx',
     '/src/workspace/FactorsPage.tsx',
-    '/src/workspace/PoolPage.tsx',
-    '/src/workspace/CombosPage.tsx',
     '/src/workspace/BacktestPage.tsx',
-    '/src/workspace/ResearchPage.tsx',
-    '/src/workspace/DataPage.tsx',
-    '/src/workspace/SettingsPage.tsx',
     '/src/workspace/WorkspaceContext.tsx',
     '/src/workspace/api.ts',
     '/src/workspace/workspace.css'

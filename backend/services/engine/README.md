@@ -221,7 +221,7 @@ python -m celery -A backend.services.engine.qlib_app.celery_config:celery_app fl
 - **云端同步**：本地保存自动触发 **Tencent COS** 同步，确保个人中心跨设备可见。
 
 ## 🚦 启动与接口
-- 默认端口：`8001`
+- 默认端口：`6789`
 - 核心入口：`POST /api/v1/pipeline/runs` (闭环流) 或 `POST /api/v1/backtest/qlib/backtest` (独立回测)
 - 认证：通过 `quantmind-api` 统一鉴权，需携带有效的 `user_id` 和 `tenant_id`。
 - CORS：开发/测试环境默认允许本机前端源；生产/预发环境必须显式配置 `CORS_ALLOWED_ORIGINS`（或 `CORS_ORIGINS`）白名单，通配符 `*` 会被拒绝。

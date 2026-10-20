@@ -2,7 +2,7 @@
 # QuantDB 接入验证：确认后端真的读到了 /data/quantdb
 set -uo pipefail
 
-BASE=${BASE:-http://127.0.0.1:8001}
+BASE=${BASE:-http://127.0.0.1:6789}
 SECRET=${INTERNAL_CALL_SECRET:?INTERNAL_CALL_SECRET 未设置——脚本不再内置默认值，请先 export 或写入 config/runtime.env}
 H=(-H "X-Internal-Call: $SECRET" -H "X-User-Id: 10000001" -H "X-Tenant-Id: default")
 

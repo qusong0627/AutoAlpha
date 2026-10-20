@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 class AIInferenceClient:
     """Client for AI Inference Service API."""
 
-    def __init__(self, base_url: str = "http://localhost:8001"):
+    def __init__(self, base_url: str = "http://localhost:6789"):
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
 
@@ -166,7 +166,7 @@ class AIInferenceClient:
 _client_instance = None
 
 
-def get_inference_client(base_url: str = "http://localhost:8001") -> AIInferenceClient:
+def get_inference_client(base_url: str = "http://localhost:6789") -> AIInferenceClient:
     """Get or create singleton inference client instance."""
     global _client_instance
     if _client_instance is None:

@@ -139,7 +139,7 @@ class EmailService:
     async def send_password_reset_email(self, email: str, reset_token: str) -> bool:
         """发送密码重置链接"""
         subject = "重置您的 QuantMind 密码"
-        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
+        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:1688").rstrip("/")
         reset_link = f"{frontend_url}/auth/reset-password?token={reset_token}"
 
         html = f"""
@@ -161,7 +161,7 @@ class EmailService:
     async def send_welcome_email(self, email: str, username: str) -> bool:
         """发送欢迎邮件"""
         subject = f"欢迎来到 QuantMind, {username}!"
-        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
+        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:1688").rstrip("/")
         html = f"""
         <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
             <h2 style="color: #2563eb;">欢迎加入 QuantMind!</h2>

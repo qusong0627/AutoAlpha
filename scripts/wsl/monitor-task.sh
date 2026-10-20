@@ -15,7 +15,7 @@ import json, sys, urllib.request
 tid = sys.argv[1]
 try:
     r = urllib.request.urlopen(
-        f"http://127.0.0.1:8001/api/v1/alpha-agent/tasks/{tid}", timeout=10
+        f"http://127.0.0.1:6789/api/v1/alpha-agent/tasks/{tid}", timeout=10
     )
     d = json.loads(r.read().decode())["data"]
     print(

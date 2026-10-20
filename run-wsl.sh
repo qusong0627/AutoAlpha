@@ -16,7 +16,7 @@ set -e
 # 必须使用 Python 3.12：pyqlib 只有 cp38~cp312 wheel 且无 sdist。
 VENV=${VENV:-/home/qusong/autoalpha-venv312}
 ROOT=/mnt/d/git/autoalpha
-PORT=${PORT:-8001}
+PORT=${PORT:-6789}
 if ! "$VENV/bin/python" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)'; then
   echo "FATAL: 因子挖掘必须使用 Python 3.12，当前解释器：$("$VENV/bin/python" -V 2>&1)" >&2
   exit 1

@@ -84,7 +84,7 @@ local machine.
 The backend also prunes terminal task-log directories older than 90 days at startup
 and once per day; active and queued task directories are retained.
 
-After stopping any manually started backend that already owns port 8001, install the
+After stopping any manually started backend that already owns port 6789, install the
 units from WSL:
 
 ```bash

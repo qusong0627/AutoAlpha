@@ -122,6 +122,6 @@ async def alipay_return(request: Request, db: AsyncSession = Depends(get_db)):
 
     # 重定向到前端成功页
     frontend_url = (
-        os.getenv("FRONTEND_URL", "http://localhost:3000") + "/payment/success"
+        os.getenv("FRONTEND_URL", "http://localhost:1688") + "/payment/success"
     )
     return RedirectResponse(url=f"{frontend_url}?orderNo={out_trade_no}")

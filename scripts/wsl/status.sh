@@ -70,7 +70,7 @@ fi
 
 echo
 echo "=============== 服务 ==============="
-if health=$(curl -fsS -m 5 http://127.0.0.1:8001/health 2>/dev/null); then
+if health=$(curl -fsS -m 5 http://127.0.0.1:6789/health 2>/dev/null); then
   printf '%s' "$health" | python3 -c "
 import json,sys
 try: d=json.load(sys.stdin)

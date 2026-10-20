@@ -7,8 +7,8 @@ import os
 from collections.abc import Iterable
 
 DEFAULT_DEV_ORIGINS = [
-    "http://127.0.0.1:3000",
-    "http://localhost:3000",
+    "http://127.0.0.1:1688",
+    "http://localhost:1688",
     "http://127.0.0.1:3001",
     "http://localhost:3001",
     "http://127.0.0.1:5173",

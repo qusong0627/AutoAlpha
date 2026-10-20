@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HEALTH_URL=${HEALTH_URL:-http://127.0.0.1:8001/health}
+HEALTH_URL=${HEALTH_URL:-http://127.0.0.1:6789/health}
 response=$(curl --fail --silent --show-error --max-time 5 "$HEALTH_URL") || {
   echo "AutoAlpha health endpoint is unreachable: $HEALTH_URL" >&2
   exit 1

@@ -56,7 +56,7 @@ mount before applying.
 ## Backend health probe
 
 The `autoalpha-healthcheck.timer` and `autoalpha-health-alert.service` check
-`http://127.0.0.1:8001/health` every minute and record a critical journal entry
+`http://127.0.0.1:6789/health` every minute and record a critical journal entry
 when the probe fails. This monitors a backend running manually as well as one
 managed by systemd; it does not restart the backend or send an external alert.
 Install from the repository root:

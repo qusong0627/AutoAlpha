@@ -144,7 +144,7 @@ class SubscriptionService:
             "http://localhost:8000/api/v1/subscription/alipay-notify",
         )
         return_url = os.getenv(
-            "ALIPAY_RETURN_URL", "http://localhost:3000/payment/success"
+            "ALIPAY_RETURN_URL", "http://localhost:1688/payment/success"
         )
 
         try:

@@ -14,7 +14,7 @@ if [ -z "$APP_PASS" ]; then
 fi
 
 echo "== 服务 /health =="
-curl -s http://127.0.0.1:8001/health | python3 -m json.tool 2>/dev/null || echo "(服务未起)"
+curl -s http://127.0.0.1:6789/health | python3 -m json.tool 2>/dev/null || echo "(服务未起)"
 
 echo
 echo "== PG 表清单 =="

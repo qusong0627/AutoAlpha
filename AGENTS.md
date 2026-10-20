@@ -40,10 +40,10 @@ Order matters: Postgres → backend → frontend.
 #   or copy config/runtime.env.example to ~/.config/autoalpha/runtime.env and fill it
 #   (if using DeepSeek, revoke the previously leaked key before setting a replacement)
 
-# backend (WSL), port 8001 — dev flags baked in: AUTH_DISABLED=1, ENABLE_STARTUP_DDL=1
+# backend (WSL), port 6789 — dev flags baked in: AUTH_DISABLED=1, ENABLE_STARTUP_DDL=1
 wsl bash /mnt/d/git/autoalpha/scripts/wsl/start-dev.sh
 
-# frontend, port 3000
+# frontend, port 1688
 D:\git\autoalpha\scripts\dev-web.cmd
 ```
 
@@ -67,7 +67,7 @@ powershell -File D:\git\autoalpha\scripts\web-smoke.ps1      # frontend modules 
 powershell -File D:\git\autoalpha\scripts\no-auth-smoke.ps1  # AUTH_DISABLED path
 ```
 
-* `GET /health` on 8001 is the single debugging surface: it returns `mounted[]`, `failed{}`,
+* `GET /health` on 6789 is the single debugging surface: it returns `mounted[]`, `failed{}`,
   `startup{}` per ensure-tables step, `auth_disabled`, `startup_ddl`.
 * Frontend gates: `cd web; npm.cmd run typecheck` (currently 0 errors) and
   `npm.cmd run build` (full graph resolution — the fastest way to catch a missing file).
@@ -197,7 +197,7 @@ Motion: `qa-fade-in-up/down/left/right` .6s · `qa-scale-in` .4s · `qa-float` 3
   `"type": "module"`, and a `.js` CJS config makes every page 500.
 * `scripts/*.ps1` must be **ASCII-only**; PowerShell 5.1 reads them as ANSI and a
   multi-byte character can break parsing.
-* **WSL cannot reach Windows-host ports.** `curl 127.0.0.1:3000` from WSL gets `000`
+* **WSL cannot reach Windows-host ports.** `curl 127.0.0.1:1688` from WSL gets `000`
   (only Windows→WSL localhost forwarding exists). Frontend smoke tests run on Windows.
 * `/data/*` dirs are created by root-run `scripts/wsl/link-quantdb.sh`; if you recreate them,
   preview `scripts/wsl/fix-data-owner.sh`, then run `scripts/wsl/fix-data-owner.sh --apply`
@@ -248,7 +248,7 @@ in `config/runtime.env` (template: `config/runtime.env.example`; `start-dev.sh` 
 | At least one of `DEEPSEEK_API_KEY`, `AI_IDE_LLM_API_KEY`, `AI_IDE_API_KEY`, `OPENAI_API_KEY` | LLM entrypoint for mining (`llm_client.py`). No defaults; rotate the previously leaked DeepSeek key before reuse. |
 | `SECRET_KEY` (recommended) | JWT signing key. Unset → regenerated every boot → all tokens die. |
 
-Before exposing port 8001 beyond localhost: set `AUTH_DISABLED=0`, drop `VITE_DISABLE_AUTH`,
+Before exposing port 6789 beyond localhost: set `AUTH_DISABLED=0`, drop `VITE_DISABLE_AUTH`,
 **and make sure `INTERNAL_CALL_SECRET` is a real random value** — turning off `AUTH_DISABLED`
 alone is not enough while a frontend proxy is willing to inject identity headers for you.
 

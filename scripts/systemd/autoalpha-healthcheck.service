@@ -7,7 +7,7 @@ OnFailure=autoalpha-health-alert.service
 Type=oneshot
 User=qusong
 Group=qusong
-Environment=HEALTH_URL=http://127.0.0.1:8001/health
+Environment=HEALTH_URL=http://127.0.0.1:6789/health
 ExecStart=/usr/bin/bash /mnt/d/git/autoalpha/scripts/wsl/healthcheck.sh
 NoNewPrivileges=true
 PrivateTmp=true

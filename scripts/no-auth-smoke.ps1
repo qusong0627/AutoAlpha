@@ -1,7 +1,7 @@
 # No-login smoke test (ASCII only: PowerShell 5.1 reads .ps1 as ANSI).
 $ErrorActionPreference = 'Continue'
-$FE = 'http://127.0.0.1:3000'
-$BE = 'http://127.0.0.1:8001'
+$FE = 'http://127.0.0.1:1688'
+$BE = 'http://127.0.0.1:6789'
 $tmp = $env:TEMP
 
 function Code($url, $out, $timeout = 90) {

@@ -72,7 +72,7 @@ class APIConfig:
     debug: bool = True
 
     # CORS配置
-    cors_origins: list[str] = field(default_factory=lambda: ["http://localhost:3000", "http://localhost:3001"])
+    cors_origins: list[str] = field(default_factory=lambda: ["http://localhost:1688", "http://localhost:3001"])
 
     # 第三方API密钥
     akshare_api_key: str = ""
@@ -201,7 +201,7 @@ class UnifiedConfigManager:
     def _init_api_config(self) -> APIConfig:
         """初始化API配置"""
         # 解析CORS origins
-        cors_origins_str = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:3001")
+        cors_origins_str = os.getenv("CORS_ORIGINS", "http://localhost:1688,http://localhost:3001")
         cors_origins = [origin.strip() for origin in cors_origins_str.split(",")]
 
         return APIConfig(

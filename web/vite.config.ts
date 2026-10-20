@@ -8,9 +8,9 @@ import path from 'path';
  * 与主应用 electron/vite.config.ts 的差异：
  *  1. 没有 Electron 相关处理（不需要主进程/预加载/IPC）；
  *  2. 没有 monaco / COS / 多服务端口那一堆 define（本模块用不到）；
- *  3. /api 代理默认指向独立后端的 8001；内部信任头**只在显式提供密钥时**才代填。
+ *  3. /api 代理默认指向独立后端的 6789；内部信任头**只在显式提供密钥时**才代填。
  */
-const apiTarget = process.env.VITE_API_URL || 'http://localhost:8001';
+const apiTarget = process.env.VITE_API_URL || 'http://localhost:6789';
 const basicSecurityHeaders = {
   'X-Content-Type-Options': 'nosniff',
   'Referrer-Policy': 'strict-origin-when-cross-origin',
@@ -164,7 +164,7 @@ export default defineConfig({
     'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV || 'development'),
   },
   server: {
-    port: parseInt(process.env.VITE_PORT || '3000'),
+    port: parseInt(process.env.VITE_PORT || '1688'),
     strictPort: true,
     host: devHost,
     headers: basicSecurityHeaders,
@@ -187,7 +187,7 @@ export default defineConfig({
         },
       },
       '/ws': {
-        target: process.env.VITE_WS_URL || 'ws://localhost:8001',
+        target: process.env.VITE_WS_URL || 'ws://localhost:6789',
         ws: true,
       },
     },

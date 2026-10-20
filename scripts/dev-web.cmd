@@ -8,10 +8,10 @@ setlocal
 cd /d "%~dp0..\web"
 
 set npm_config_registry=https://registry.npmmirror.com/
-REM Backend: standalone factor-mining service (8001)
-set VITE_API_URL=http://localhost:8001
-set VITE_API_BASE_URL=http://localhost:8001
-set VITE_PORT=3000
+REM Backend: standalone factor-mining service (6789)
+set VITE_API_URL=http://localhost:6789
+set VITE_API_BASE_URL=http://localhost:6789
+set VITE_PORT=1688
 REM Internal identity headers are NOT hardcoded here anymore. The vite proxy only
 REM injects them when INTERNAL_CALL_SECRET is present in the environment; with
 REM AUTH_DISABLED=1 (the dev default) no headers are needed at all. To exercise
@@ -23,7 +23,7 @@ if not exist node_modules (
   call "%ProgramFiles%\nodejs\npm.cmd" ci --no-audit --no-fund || goto :fail
 )
 
-echo [2/2] starting vite -^> http://localhost:3000
+echo [2/2] starting vite -^> http://localhost:1688
 call "%ProgramFiles%\nodejs\npm.cmd" run dev
 goto :eof
 
