@@ -15,15 +15,38 @@
 
 ## 界面预览
 
-![首页：自然语言描述挖矿需求](docs/images/home.png)
+### 首页
+用自然语言描述挖矿需求，AI 自动拆解挖掘方向；下方三个入口分别通往任务中心、因子库管理与全周期回测。
 
-![参数配置：算法/股票池/窗口/数据源](docs/images/mining-config.png)
+![首页](docs/images/home.png)
 
-![任务中心：进度/日志/产出因子](docs/images/tasks.png)
+---
 
-![因子库：表达式与 IC/RankIC/ICIR](docs/images/factors.png)
+### 参数配置
+选择挖掘算法（RD-Agent/统计派）、股票池、数据频率、挖掘/验证时间窗口与质量门禁，勾选参与挖掘的数据集，可独立开启样本外验证。
 
-![回测中心：收益曲线与 IC 序列](docs/images/backtest.png)
+![参数配置](docs/images/mining-config.png)
+
+---
+
+### 任务中心
+查看任务进度、实验参数与数据版本，实时跟踪挖掘日志（跟随最新/刷新），完成后可查看产出因子、下载任务记录与决策轨迹。
+
+![任务中心](docs/images/tasks.png)
+
+---
+
+### 因子库
+按总数与高中低质量分档统计已挖掘因子，列表展示表达式与 IC/RankIC/ICIR，支持搜索、股票池/方向筛选，以及详情、回测、删除操作。
+
+![因子库](docs/images/factors.png)
+
+---
+
+### 回测中心
+展示 IC、RankIC、ICIR、夏普、年化收益、最大回撤、换手等验证指标，附收益曲线（基准/因子/超额）与 IC 序列图，支持导出 PDF 报告。
+
+![回测中心](docs/images/backtest.png)
 
 ## 技术栈
 
