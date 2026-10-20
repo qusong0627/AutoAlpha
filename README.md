@@ -15,13 +15,13 @@
 
 ## 界面预览
 
-| 首页：自然语言描述挖矿需求 | 参数配置：算法/股票池/窗口/数据源 |
-|---|---|
-| ![首页](docs/images/home.png) | ![参数配置](docs/images/mining-config.png) |
+![首页：自然语言描述挖矿需求](docs/images/home.png)
 
-| 任务中心：进度/日志/产出因子 | 因子库：表达式与 IC/RankIC/ICIR |
-|---|---|
-| ![任务中心](docs/images/tasks.png) | ![因子库](docs/images/factors.png) |
+![参数配置：算法/股票池/窗口/数据源](docs/images/mining-config.png)
+
+![任务中心：进度/日志/产出因子](docs/images/tasks.png)
+
+![因子库：表达式与 IC/RankIC/ICIR](docs/images/factors.png)
 
 ![回测中心：收益曲线与 IC 序列](docs/images/backtest.png)
 
