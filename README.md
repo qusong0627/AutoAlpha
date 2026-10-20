@@ -13,6 +13,18 @@
 * Admin：挖掘因子毕业为训练特征、`rd_mined` 物化控制台
 * 健康检查：`GET /health` 返回 `mounted / failed / startup / auth_disabled / startup_ddl`
 
+## 界面预览
+
+| 首页：自然语言描述挖矿需求 | 参数配置：算法/股票池/窗口/数据源 |
+|---|---|
+| ![首页](docs/images/home.png) | ![参数配置](docs/images/mining-config.png) |
+
+| 任务中心：进度/日志/产出因子 | 因子库：表达式与 IC/RankIC/ICIR |
+|---|---|
+| ![任务中心](docs/images/tasks.png) | ![因子库](docs/images/factors.png) |
+
+![回测中心：收益曲线与 IC 序列](docs/images/backtest.png)
+
 ## 技术栈
 
 * 后端：FastAPI，**必须 Python 3.12**（`pyqlib==0.9.7` 只有 cp38~cp312 wheel，无 sdist，3.14 不可用）
